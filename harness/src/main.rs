@@ -1,5 +1,6 @@
 use alloy_primitives::B256;
 use futures::StreamExt;
+use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use reth_chainspec::MAINNET;
 use reth_eth_wire::EthNetworkPrimitives;
 use reth_eth_wire_types::{
@@ -279,6 +280,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    let progress_rx = shutdown_rx.clone();
+    spawn_progress_bar(Arc::clone(&context), progress_rx);
     spawn_window_stats(Arc::clone(&context));
 
     if let Some(seconds) = context.config.run_secs {
@@ -296,14 +299,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ = shutdown_rx.changed() => {},
         }
     }
+    let _ = context.shutdown_tx.send(true);
 
     let completed_blocks = context.completed_blocks().await;
     let summary =
         summarize_stats(&context.stats, run_start.elapsed(), context.total_targets, completed_blocks)
             .await;
-    if !context.config.quiet && context.config.verbosity == Verbosity::Minimal {
-        println!();
-    }
     context.logger.log_stats(summary).await;
     context.logger.flush_all().await;
     Ok(())
@@ -1687,13 +1688,6 @@ fn spawn_window_stats(context: Arc<RunContext>) {
         loop {
             ticker.tick().await;
             let queue_len = context.queue_len().await;
-            let active_peers = context.active_peers.lock().await.len();
-            let peers_with_jobs = context.peers_with_jobs.lock().await.len();
-            let completed = context.completed_blocks().await;
-            let failed = context.failed_blocks_total().await as usize;
-            let discovered = context.discovered.load(Ordering::SeqCst);
-            let sessions = context.sessions.load(Ordering::SeqCst);
-            let jobs_assigned = context.jobs_assigned.load(Ordering::SeqCst);
             let in_flight = context.in_flight.load(Ordering::SeqCst);
             let mut window = context.window.lock().await;
             let snapshot = window.take_snapshot();
@@ -1712,7 +1706,7 @@ fn spawn_window_stats(context: Arc<RunContext>) {
                 "event": "window_stats",
                 "interval_secs": interval.as_secs(),
                 "queue_len": queue_len,
-                "active_peers_total": active_peers,
+                "active_peers_total": context.active_peers.lock().await.len(),
                 "active_peers_window": snapshot.peers.len(),
                 "probes_per_sec": probes_per_sec,
                 "blocks_per_sec": blocks_per_sec,
@@ -1722,48 +1716,12 @@ fn spawn_window_stats(context: Arc<RunContext>) {
                 "receipts_p95_ms": receipts_p95,
                 "at_ms": now_ms(),
             });
-            if !context.config.quiet {
-                let progress = format_progress_line(
-                    completed,
-                    failed,
-                    context.total_targets,
-                    queue_len,
-                    in_flight,
-                    discovered,
-                    sessions,
-                    active_peers,
-                    peers_with_jobs,
-                    jobs_assigned,
-                );
-                if context.config.verbosity == Verbosity::Minimal {
-                    print!("\r{progress}");
-                    let _ = std::io::stdout().flush();
-                } else {
-                    println!("{progress}");
-                }
-                if context.config.verbosity >= Verbosity::V1 {
-                    println!(
-                        "window blocks/s={:.2} probes/s={:.2} hdr_p50/p95={}ms/{}ms rcp_p50/p95={}ms/{}ms active_peers_window={}",
-                        blocks_per_sec,
-                        probes_per_sec,
-                        header_p50,
-                        header_p95,
-                        receipts_p50,
-                        receipts_p95,
-                        snapshot.peers.len(),
-                    );
-                }
-                if context.config.verbosity >= Verbosity::V2 {
-                    if let Some(summary) = top_peer_summary(&context, 5).await {
-                        println!("{summary}");
-                    }
-                }
-            }
             context.logger.log_stats(payload).await;
 
             if queue_len == 0
                 && in_flight == 0
-                && completed + failed >= context.total_targets
+                && context.completed_blocks().await + context.failed_blocks_total().await as usize
+                    >= context.total_targets
             {
                 drain_streak = drain_streak.saturating_add(1);
                 context
@@ -1779,68 +1737,43 @@ fn spawn_window_stats(context: Arc<RunContext>) {
     });
 }
 
-fn format_progress_line(
-    completed: usize,
-    failed: usize,
-    total: usize,
-    queue_len: usize,
-    in_flight: u64,
-    discovered: u64,
-    sessions: u64,
-    active_peers: usize,
-    peers_with_jobs: usize,
-    jobs_assigned: u64,
-) -> String {
-    let pct = if total > 0 {
-        (completed as f64 / total as f64) * 100.0
-    } else {
-        0.0
-    };
-    format!(
-        "progress {}/{} ({:.1}%) | failed={} | queue={} in_flight={} | peers: discovered={} sessions={} active={} assigned={} jobs={} ",
-        completed,
-        total,
-        pct,
-        failed,
-        queue_len,
-        in_flight,
-        discovered,
-        sessions,
-        active_peers,
-        peers_with_jobs,
-        jobs_assigned
+fn spawn_progress_bar(context: Arc<RunContext>, mut shutdown_rx: tokio::sync::watch::Receiver<bool>) {
+    if context.config.quiet {
+        return;
+    }
+    let total = context.total_targets as u64;
+    let pb = ProgressBar::with_draw_target(
+        Some(total),
+        ProgressDrawTarget::stderr_with_hz(10),
+    );
+    let style = ProgressStyle::with_template(
+        "{bar:40.cyan/blue} {percent:>3}% {pos}/{len} | {elapsed_precise} | ETA {eta_precise} | speed {per_sec} | {msg}",
     )
-}
-
-async fn top_peer_summary(context: &RunContext, limit: usize) -> Option<String> {
-    let stats = context.stats.lock().await;
-    if stats.peer_stats.is_empty() {
-        return None;
-    }
-    let mut peers: Vec<_> = stats.peer_stats.iter().collect();
-    peers.sort_by(|a, b| b.1.blocks_ok.cmp(&a.1.blocks_ok));
-    let mut parts = Vec::new();
-    for (peer, stat) in peers.into_iter().take(limit) {
-        let avg_header_ms = if stat.header_ok > 0 {
-            stat.header_ms_sum as f64 / stat.header_ok as f64
-        } else {
-            0.0
-        };
-        let avg_receipts_ms = if stat.receipts_ok > 0 {
-            stat.receipts_ms_sum as f64 / stat.receipts_ok as f64
-        } else {
-            0.0
-        };
-        parts.push(format!(
-            "{} ok={}/{} hdr={:.1}ms rcp={:.1}ms",
-            peer,
-            stat.blocks_ok,
-            stat.blocks_total,
-            avg_header_ms,
-            avg_receipts_ms
-        ));
-    }
-    Some(format!("top_peers | {}", parts.join(" | ")))
+    .unwrap()
+    .progress_chars("=>-");
+    pb.set_style(style);
+    pb.set_message("peers 0");
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_millis(100));
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    let completed = context.completed_blocks().await;
+                    let failed = context.failed_blocks_total().await as usize;
+                    let processed = completed + failed;
+                    let active = context.active_peers.lock().await.len();
+                    let sessions = context.sessions.load(Ordering::SeqCst);
+                    let msg = format!("peers {}/{}", active, sessions);
+                    pb.set_message(msg);
+                    pb.set_position(processed.min(context.total_targets) as u64);
+                }
+                _ = shutdown_rx.changed() => {
+                    break;
+                }
+            }
+        }
+        pb.finish_and_clear();
+    });
 }
 
 fn percentile(values: &mut Vec<u128>, percentile: f64) -> u128 {
