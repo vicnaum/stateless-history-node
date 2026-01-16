@@ -14,6 +14,7 @@ use reth_network_api::{
     DiscoveredEvent, DiscoveryEvent, NetworkEvent, NetworkEventListenerProvider, PeerId,
     PeerRequest, PeerRequestSender,
 };
+use reth_network_api::events::PeerEvent;
 use reth_network::PeersConfig;
 use reth_primitives_traits::{Header, SealedHeader};
 use serde_json::json;
@@ -26,6 +27,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, oneshot, Mutex};
+#[cfg(unix)]
+use tokio::signal::unix::{signal, SignalKind};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -36,8 +39,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "error"
     } else if config.verbosity >= Verbosity::V3 {
         "info"
-    } else {
+    } else if config.verbosity >= Verbosity::V2 {
         "warn"
+    } else {
+        "error"
     };
     let filter = if std::env::var("RUST_LOG").is_ok() {
         EnvFilter::from_default_env()
@@ -213,75 +218,87 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ready_tx_for_events = ready_tx.clone();
     tokio::spawn(async move {
         while let Some(event) = event_listener.next().await {
-            if let NetworkEvent::ActivePeerSession { info, messages } = event {
-                let matches_genesis = info.status.genesis == MAINNET.genesis_hash();
-                if !matches_genesis {
-                    warn!(
+            match event {
+                NetworkEvent::ActivePeerSession { info, messages } => {
+                    let matches_genesis = info.status.genesis == MAINNET.genesis_hash();
+                    if !matches_genesis {
+                        warn!(
+                            peer_id = ?info.peer_id,
+                            genesis = ?info.status.genesis,
+                            "peer genesis mismatch"
+                        );
+                        continue;
+                    }
+
+                    info!(
                         peer_id = ?info.peer_id,
-                        genesis = ?info.status.genesis,
-                        "peer genesis mismatch"
+                        client_version = %info.client_version,
+                        remote_addr = ?info.remote_addr,
+                        eth_version = ?info.version,
+                        chain = ?info.status.chain,
+                        head_hash = ?info.status.blockhash,
+                        "peer session established"
                     );
-                    continue;
-                }
 
-                info!(
-                    peer_id = ?info.peer_id,
-                    client_version = %info.client_version,
-                    remote_addr = ?info.remote_addr,
-                    eth_version = ?info.version,
-                    chain = ?info.status.chain,
-                    head_hash = ?info.status.blockhash,
-                    "peer session established"
-                );
+                    context_for_events
+                        .stats
+                        .lock()
+                        .await
+                        .record_peer(info.client_version.as_ref());
 
-                context_for_events
-                    .stats
-                    .lock()
-                    .await
-                    .record_peer(info.client_version.as_ref());
+                    let peer_id = info.peer_id;
+                    let peer_key = format!("{:?}", peer_id);
+                    let head_hash = info.status.blockhash;
+                    let messages = messages.clone();
+                    let context = Arc::clone(&context_for_events);
+                    let ready_tx = ready_tx_for_events.clone();
 
-                let peer_id = info.peer_id;
-                let peer_key = format!("{:?}", peer_id);
-                let head_hash = info.status.blockhash;
-                let messages = messages.clone();
-                let context = Arc::clone(&context_for_events);
-                let ready_tx = ready_tx_for_events.clone();
+                    tokio::spawn(async move {
+                        let head_start = Instant::now();
+                        let head_number = match request_head_number(
+                            peer_id,
+                            info.version,
+                            BlockHashOrNumber::Hash(head_hash),
+                            &messages,
+                            context.as_ref(),
+                        )
+                        .await
+                        {
+                            Ok(number) => {
+                                info!(
+                                    peer_id = ?peer_id,
+                                    head_number = number,
+                                    head_ms = head_start.elapsed().as_millis(),
+                                    "peer head resolved"
+                                );
+                                number
+                            }
+                            Err(err) => {
+                                let _ = context
+                                    .handle_peer_failure(peer_id, &peer_key, "head")
+                                    .await;
+                                warn!(peer_id = ?peer_id, error = %err, "head header request failed");
+                                return;
+                            }
+                        };
 
-                tokio::spawn(async move {
-                    let head_start = Instant::now();
-                    let head_number = match request_head_number(
-                        peer_id,
-                        info.version,
-                        BlockHashOrNumber::Hash(head_hash),
-                        &messages,
-                        context.as_ref(),
-                    )
-                    .await
-                    {
-                        Ok(number) => {
-                            info!(
-                                peer_id = ?peer_id,
-                                head_number = number,
-                                head_ms = head_start.elapsed().as_millis(),
-                                "peer head resolved"
-                            );
-                            number
-                        }
-                        Err(err) => {
-                            warn!(peer_id = ?peer_id, error = %err, "head header request failed");
-                            return;
-                        }
-                    };
-
-                    context.record_active_peer(peer_key.clone()).await;
-                    let _ = ready_tx.send(PeerHandle {
-                        peer_id,
-                        peer_key,
-                        eth_version: info.version,
-                        head_number,
-                        messages,
+                        context.record_active_peer(peer_key.clone()).await;
+                        let _ = ready_tx.send(PeerHandle {
+                            peer_id,
+                            peer_key,
+                            eth_version: info.version,
+                            head_number,
+                            messages,
+                        });
                     });
-                });
+                }
+                NetworkEvent::Peer(peer_event) => match peer_event {
+                    PeerEvent::SessionClosed { peer_id, .. } | PeerEvent::PeerRemoved(peer_id) => {
+                        let peer_key = format!("{:?}", peer_id);
+                        context_for_events.record_peer_disconnect(&peer_key).await;
+                    }
+                    _ => {}
+                },
             }
         }
     });
@@ -293,7 +310,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(seconds) = context.config.run_secs {
         info!(run_secs = seconds, "auto-shutdown enabled");
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {},
+            _ = wait_for_shutdown_signal() => {},
             _ = tokio::time::sleep(Duration::from_secs(seconds)) => {
                 info!("auto-shutdown reached");
             },
@@ -301,7 +318,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     } else {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {},
+            _ = wait_for_shutdown_signal() => {},
             _ = shutdown_rx.changed() => {},
         }
     }
@@ -313,6 +330,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await;
     context.logger.log_stats(summary).await;
     context.logger.flush_all().await;
+    let missing_blocks = {
+        let known = context.known_blocks.lock().await;
+        match write_missing_blocks(&out_dir, context.config.anchor_window, &known) {
+            Ok(count) => count,
+            Err(err) => {
+                warn!(error = ?err, "failed to write missing blocks");
+                0
+            }
+        }
+    };
     if !context.config.quiet {
         let (elapsed_secs, fetched_blocks, avg_speed, avg_window, max_speed, failed_blocks) = {
             let stats = context.stats.lock().await;
@@ -351,6 +378,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 avg_speed,
                 avg_window,
                 max_speed
+            );
+        }
+        if missing_blocks > 0 {
+            println!(
+                "Missing blocks: {} (saved to output/missing_blocks.jsonl).",
+                missing_blocks
             );
         }
     }
@@ -638,8 +671,6 @@ async fn request_head_number(
 }
 
 fn build_anchor_targets(anchor_window: u64) -> Vec<u64> {
-    const ANCHORS: [u64; 5] = [10_000_835, 11_362_579, 12_369_621, 16_291_127, 21_688_329];
-
     let mut targets = Vec::new();
     for anchor in ANCHORS {
         for offset in 0..anchor_window {
@@ -650,6 +681,50 @@ fn build_anchor_targets(anchor_window: u64) -> Vec<u64> {
     targets.sort_unstable();
     targets.dedup();
     targets
+}
+
+async fn wait_for_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut sigint =
+            signal(SignalKind::interrupt()).expect("failed to register SIGINT handler");
+        let mut sigterm =
+            signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
+        tokio::select! {
+            _ = sigint.recv() => {},
+            _ = sigterm.recv() => {},
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+fn write_missing_blocks(
+    out_dir: &PathBuf,
+    anchor_window: u64,
+    known_blocks: &HashSet<u64>,
+) -> std::io::Result<usize> {
+    let path = out_dir.join("missing_blocks.jsonl");
+    let file = File::create(&path)?;
+    let mut writer = BufWriter::new(file);
+    let mut missing = 0usize;
+    for anchor in ANCHORS {
+        for offset in 0..anchor_window {
+            let block = anchor + offset;
+            if !known_blocks.contains(&block) {
+                writeln!(writer, "{}", json!({ "block": block }))?;
+                missing += 1;
+            }
+        }
+    }
+    writer.flush()?;
+    if missing == 0 {
+        drop(writer);
+        let _ = std::fs::remove_file(&path);
+    }
+    Ok(missing)
 }
 
 async fn probe_block_batch(
@@ -1293,42 +1368,56 @@ impl RunContext {
     }
 
     async fn pop_escalation_for_peer(&self, peer_key: &str) -> Vec<u64> {
-        let mut queue = self.escalation_queue.lock().await;
-        let mut queued = self.escalation_queued.lock().await;
-        let known = self.known_blocks.lock().await;
-        let mut attempts = self.escalation_attempts.lock().await;
-        let sessions = self.sessions.load(Ordering::SeqCst) as usize;
-        let mut iterations = queue.len();
-        while iterations > 0 {
-            iterations -= 1;
-            if let Some(block) = queue.pop_front() {
-                queued.remove(&block);
-                if known.contains(&block) {
-                    continue;
+        let active_peers = self.active_peers_count().await;
+        let mut exhausted_count = 0usize;
+        let result = {
+            let mut queue = self.escalation_queue.lock().await;
+            let mut queued = self.escalation_queued.lock().await;
+            let known = self.known_blocks.lock().await;
+            let mut attempts = self.escalation_attempts.lock().await;
+            let mut iterations = queue.len();
+            while iterations > 0 {
+                iterations -= 1;
+                if let Some(block) = queue.pop_front() {
+                    queued.remove(&block);
+                    if known.contains(&block) {
+                        continue;
+                    }
+                    let entry = attempts.entry(block).or_default();
+                    if entry.contains(peer_key) {
+                        queue.push_back(block);
+                        queued.insert(block);
+                        continue;
+                    }
+                    if active_peers > 0 && entry.len() >= active_peers {
+                        exhausted_count += 1;
+                        continue;
+                    }
+                    entry.insert(peer_key.to_string());
+                    return vec![block];
                 }
-                let entry = attempts.entry(block).or_default();
-                if entry.contains(peer_key) {
-                    queue.push_back(block);
-                    queued.insert(block);
-                    continue;
-                }
-                if sessions > 0 && entry.len() >= sessions {
-                    continue;
-                }
-                entry.insert(peer_key.to_string());
-                return vec![block];
+            }
+            Vec::new()
+        };
+        if exhausted_count > 0 {
+            for _ in 0..exhausted_count {
+                self.record_failure_reason("escalation_exhausted").await;
             }
         }
-        Vec::new()
+        result
     }
 
     async fn requeue_escalation_block(&self, block: u64) {
-        let sessions = self.sessions.load(Ordering::SeqCst) as usize;
+        let active_peers = self.active_peers_count().await;
         let tried = {
             let attempts = self.escalation_attempts.lock().await;
             attempts.get(&block).map(|s| s.len()).unwrap_or(0)
         };
-        if sessions > 0 && tried >= sessions {
+        if active_peers == 0 {
+            self.record_failure_reason("escalation_no_peers").await;
+            return;
+        }
+        if tried >= active_peers {
             self.record_failure_reason("escalation_exhausted").await;
             return;
         }
@@ -1380,6 +1469,24 @@ impl RunContext {
         if active.insert(peer_key) {
             self.sessions.fetch_add(1, Ordering::SeqCst);
         }
+    }
+
+    async fn record_peer_disconnect(&self, peer_key: &str) {
+        let mut active = self.active_peers.lock().await;
+        if active.remove(peer_key) {
+            let current = self.sessions.load(Ordering::SeqCst);
+            if current > 0 {
+                self.sessions.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    async fn active_peers_count(&self) -> usize {
+        self.active_peers.lock().await.len()
+    }
+
+    async fn escalation_attempted_blocks(&self) -> usize {
+        self.escalation_attempts.lock().await.len()
     }
 
     async fn record_peer_job(&self, peer_key: &str) {
@@ -1610,6 +1717,7 @@ struct PeerHandle {
     messages: PeerRequestSender<PeerRequest<EthNetworkPrimitives>>,
 }
 
+const ANCHORS: [u64; 5] = [10_000_835, 11_362_579, 12_369_621, 16_291_127, 21_688_329];
 const WARMUP_SECS: u64 = 3;
 
 #[derive(Default)]
@@ -1979,15 +2087,20 @@ fn spawn_progress_bar(
         ProgressDrawTarget::stderr_with_hz(10),
     );
     let style = ProgressStyle::with_template(
-        "{bar:40.cyan/blue} {percent:>3}% {pos}/{len} | {elapsed_precise} | ETA {eta_precise} | speed {per_sec} | {msg}",
+        "{bar:40.cyan/blue} {percent:>3}% {pos}/{len} | {elapsed_precise} | {msg}",
     )
     .unwrap()
     .progress_chars("=>-");
     pb.set_style(style);
-    pb.set_message("status looking_for_peers | peers 0/0");
+    pb.set_message("status looking_for_peers | peers 0/0 | queue 0 | inflight 0 | Failed 0 | speed 0.0/s | eta --");
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_millis(100));
         let mut sent_shutdown = false;
+        let mut main_finished = false;
+        let mut escalation_total = 0u64;
+        let mut escalation_pb: Option<ProgressBar> = None;
+        let mut main_window: VecDeque<(Instant, u64)> = VecDeque::new();
+        let mut escalation_window: VecDeque<(Instant, u64)> = VecDeque::new();
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
@@ -2000,6 +2113,13 @@ fn spawn_progress_bar(
                     let in_flight = context.in_flight.load(Ordering::SeqCst);
                     let escalation_active = context.escalation_active.load(Ordering::SeqCst);
                     let escalation_len = context.escalation_len().await;
+                    let failed_u64 = failed as u64;
+                    if failed_u64 > escalation_total {
+                        escalation_total = failed_u64;
+                        if let Some(ref pb) = escalation_pb {
+                            pb.set_length(escalation_total);
+                        }
+                    }
                     let status = if sessions == 0 {
                         "looking_for_peers"
                     } else if escalation_active && escalation_len > 0 {
@@ -2009,9 +2129,110 @@ fn spawn_progress_bar(
                     } else {
                         "fetching"
                     };
-                    let msg = format!("status {} | peers {}/{}", status, active, sessions);
-                    pb.set_message(msg);
-                    pb.set_position(processed.min(context.total_targets) as u64);
+                    if !main_finished {
+                        let now = Instant::now();
+                        main_window.push_back((now, processed as u64));
+                        while let Some((t, _)) = main_window.front() {
+                            if now.duration_since(*t) > Duration::from_secs(1) && main_window.len() > 1 {
+                                main_window.pop_front();
+                            } else {
+                                break;
+                            }
+                        }
+                        let speed = if let (Some((t0, v0)), Some((t1, v1))) =
+                            (main_window.front(), main_window.back())
+                        {
+                            let dt = t1.duration_since(*t0).as_secs_f64();
+                            if dt > 0.0 && v1 >= v0 {
+                                (v1 - v0) as f64 / dt
+                            } else {
+                                0.0
+                            }
+                        } else {
+                            0.0
+                        };
+                        let remaining = context.total_targets.saturating_sub(processed) as f64;
+                        let eta = if speed > 0.0 {
+                            format!("{:.0}s", remaining / speed)
+                        } else {
+                            "--".to_string()
+                        };
+                        let msg = format!(
+                            "status {} | peers {}/{} | queue {} | inflight {} | Failed {} | speed {:.1}/s | eta {}",
+                            status, active, sessions, queue_len, in_flight, failed, speed, eta
+                        );
+                        pb.set_message(msg);
+                        pb.set_position(processed.min(context.total_targets) as u64);
+                    }
+
+                    if !main_finished && processed >= context.total_targets && queue_len == 0 {
+                        main_finished = true;
+                        pb.finish_and_clear();
+                    }
+
+                    if main_finished {
+                        if escalation_total == 0 && failed_u64 > 0 {
+                            escalation_total = failed_u64;
+                        }
+                        if escalation_total > 0 {
+                            if escalation_pb.is_none() {
+                                let esc_pb = ProgressBar::with_draw_target(
+                                    Some(escalation_total),
+                                    ProgressDrawTarget::stderr_with_hz(10),
+                                );
+                                let esc_style = ProgressStyle::with_template(
+                                        "{bar:40.red/black} {percent:>3}% {pos}/{len} | {elapsed_precise} | {msg}",
+                                )
+                                .unwrap()
+                                .progress_chars("=>-");
+                                esc_pb.set_style(esc_style);
+                                esc_pb.set_message("status escalating_failed | failed 0/0 | tried 0/0 | peers 0/0 | inflight 0 | queue 0");
+                                escalation_pb = Some(esc_pb);
+                            }
+                            let remaining = failed_u64;
+                            let done = escalation_total.saturating_sub(remaining);
+                                let now = Instant::now();
+                                escalation_window.push_back((now, done));
+                                while let Some((t, _)) = escalation_window.front() {
+                                    if now.duration_since(*t) > Duration::from_secs(1)
+                                        && escalation_window.len() > 1
+                                    {
+                                        escalation_window.pop_front();
+                                    } else {
+                                        break;
+                                    }
+                                }
+                                let esc_speed =
+                                    if let (Some((t0, v0)), Some((t1, v1))) = (
+                                        escalation_window.front(),
+                                        escalation_window.back(),
+                                    ) {
+                                        let dt = t1.duration_since(*t0).as_secs_f64();
+                                        if dt > 0.0 && v1 >= v0 {
+                                            (v1 - v0) as f64 / dt
+                                        } else {
+                                            0.0
+                                        }
+                                    } else {
+                                        0.0
+                                    };
+                                let esc_eta = if esc_speed > 0.0 {
+                                    format!("{:.0}s", remaining as f64 / esc_speed)
+                                } else {
+                                    "--".to_string()
+                                };
+                            if let Some(ref pb) = escalation_pb {
+                                let attempted = context.escalation_attempted_blocks().await;
+                                let msg = format!(
+                                        "failed {remaining}/{escalation_total} | tried {attempted}/{escalation_total} | peers {active}/{sessions} | inflight {in_flight} | queue {escalation_len} | speed {:.1}/s | eta {}",
+                                        esc_speed,
+                                        esc_eta
+                                );
+                                pb.set_message(msg);
+                                pb.set_position(done);
+                            }
+                        }
+                    }
                     if !sent_shutdown
                         && processed >= context.total_targets
                         && queue_len == 0
@@ -2027,7 +2248,12 @@ fn spawn_progress_bar(
                 }
             }
         }
-        pb.finish_and_clear();
+        if !main_finished {
+            pb.finish_and_clear();
+        }
+        if let Some(pb) = escalation_pb {
+            pb.finish_and_clear();
+        }
     });
 }
 
