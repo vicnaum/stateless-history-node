@@ -9,12 +9,15 @@ use reth_eth_wire_types::{
 use reth_network::config::{rng_secret_key, NetworkConfigBuilder};
 use reth_network::import::ProofOfStakeBlockImport;
 use reth_network_api::{
+    test_utils::{PeersHandle, PeersHandleProvider},
     DiscoveredEvent, DiscoveryEvent, NetworkEvent, NetworkEventListenerProvider, PeerId,
     PeerRequest, PeerRequestSender,
 };
+use reth_network::PeersConfig;
 use reth_primitives_traits::{Header, SealedHeader};
 use serde_json::json;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::PathBuf;
@@ -31,7 +34,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse()?))
         .init();
 
-    let run_secs = parse_run_secs();
+    let config = CliConfig::parse();
+    let log_flush_lines = config.log_flush_lines;
+    let log_flush_ms = config.log_flush_ms;
     let run_start = Instant::now();
 
     let out_dir = PathBuf::from("output");
@@ -39,19 +44,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let known_path = out_dir.join("known_blocks.jsonl");
     let known_blocks = load_known_blocks(&known_path);
     let targets = build_anchor_targets();
-    let pending_targets: VecDeque<u64> = targets
+    let pending_blocks: Vec<u64> = targets
         .into_iter()
         .filter(|block| !known_blocks.contains(block))
         .collect();
+    let queued_blocks: HashSet<u64> = pending_blocks.iter().copied().collect();
+    let pending_targets: BinaryHeap<Reverse<u64>> =
+        pending_blocks.into_iter().map(Reverse).collect();
+
+    let secret_key = rng_secret_key();
+    let mut peers_config = PeersConfig::default()
+        .with_max_outbound(config.max_outbound)
+        .with_max_concurrent_dials(config.max_concurrent_dials)
+        .with_refill_slots_interval(Duration::from_millis(config.refill_interval_ms));
+    if let Some(max_inbound) = config.max_inbound {
+        peers_config = peers_config.with_max_inbound(max_inbound);
+    }
+
+    let net_config = NetworkConfigBuilder::<EthNetworkPrimitives>::new(secret_key)
+        .mainnet_boot_nodes()
+        .with_unused_ports()
+        .peer_config(peers_config)
+        .disable_tx_gossip(true)
+        .block_import(Box::new(ProofOfStakeBlockImport::default()))
+        .build_with_noop_provider(MAINNET.clone());
+
+    let handle = net_config.start_network().await?;
+    let peers_handle = handle.peers_handle().clone();
 
     let context = Arc::new(RunContext {
         stats: Mutex::new(Stats::default()),
         queue: Mutex::new(pending_targets),
         known_blocks: Mutex::new(known_blocks),
+        queued_blocks: Mutex::new(queued_blocks),
+        attempts: Mutex::new(HashMap::new()),
         peer_health: Mutex::new(HashMap::new()),
-        logger: Logger::new(&out_dir)?,
+        active_peers: Mutex::new(HashSet::new()),
+        window: Mutex::new(WindowStats::default()),
+        config,
+        peers_handle,
+        logger: Logger::new(&out_dir, log_flush_lines)?,
         request_id: AtomicU64::new(1),
     });
+    if log_flush_ms > 0 {
+        context
+            .logger
+            .spawn_flush_tasks(Duration::from_millis(log_flush_ms));
+    }
+
     let (ready_tx, mut ready_rx) = mpsc::unbounded_channel::<PeerHandle>();
 
     let scheduler_context = Arc::clone(&context);
@@ -75,40 +115,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
 
-            let Some(block_number) = scheduler_context
-                .pop_next_block_for_head(peer.head_number)
-                .await
-            else {
+            let batch = scheduler_context
+                .pop_next_batch_for_head(peer.head_number)
+                .await;
+            if batch.is_empty() {
                 continue;
-            };
+            }
 
             let context = Arc::clone(&scheduler_context);
             let ready_tx = scheduler_ready_tx.clone();
             tokio::spawn(async move {
                 let peer_for_probe = peer.clone();
-                probe_block(
+                let should_requeue = probe_block_batch(
                     peer_for_probe.peer_id,
                     peer_for_probe.peer_key,
                     peer_for_probe.messages,
                     peer_for_probe.eth_version,
-                    block_number,
+                    batch,
                     Arc::clone(&context),
                 )
                 .await;
-                let _ = ready_tx.send(peer);
+                if should_requeue {
+                    let _ = ready_tx.send(peer);
+                }
             });
         }
     });
-
-    let secret_key = rng_secret_key();
-    let config = NetworkConfigBuilder::<EthNetworkPrimitives>::new(secret_key)
-        .mainnet_boot_nodes()
-        .with_unused_ports()
-        .disable_tx_gossip(true)
-        .block_import(Box::new(ProofOfStakeBlockImport::default()))
-        .build_with_noop_provider(MAINNET.clone());
-
-    let handle = config.start_network().await?;
 
     info!(peer_id = ?handle.peer_id(), "network started");
     println!("receipt-harness: network started");
@@ -208,6 +240,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     };
 
+                    context.record_active_peer(peer_key.clone()).await;
                     let _ = ready_tx.send(PeerHandle {
                         peer_id,
                         peer_key,
@@ -220,7 +253,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    if let Some(seconds) = run_secs {
+    spawn_window_stats(Arc::clone(&context));
+
+    if let Some(seconds) = context.config.run_secs {
         info!(run_secs = seconds, "auto-shutdown enabled");
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {},
@@ -234,20 +269,144 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let summary = summarize_stats(&context.stats, run_start.elapsed()).await;
     println!("{}", summary);
+    context.logger.flush_all().await;
     Ok(())
 }
 
-fn parse_run_secs() -> Option<u64> {
-    let mut args = std::env::args().skip(1);
-    while let Some(arg) = args.next() {
-        if let Some(value) = arg.strip_prefix("--run-secs=") {
-            return value.parse().ok();
-        }
-        if arg == "--run-secs" {
-            return args.next().and_then(|value| value.parse().ok());
+#[derive(Clone, Debug)]
+struct CliConfig {
+    run_secs: Option<u64>,
+    max_outbound: usize,
+    max_concurrent_dials: usize,
+    refill_interval_ms: u64,
+    max_inbound: Option<usize>,
+    blocks_per_assignment: usize,
+    receipts_per_request: usize,
+    request_timeout_ms: u64,
+    log_flush_ms: u64,
+    log_flush_lines: usize,
+    quiet: bool,
+    peer_failure_threshold: u32,
+    peer_ban_secs: u64,
+    max_attempts: u32,
+    stats_interval_secs: u64,
+}
+
+impl Default for CliConfig {
+    fn default() -> Self {
+        Self {
+            run_secs: None,
+            max_outbound: 400,
+            max_concurrent_dials: 100,
+            refill_interval_ms: 500,
+            max_inbound: None,
+            blocks_per_assignment: 32,
+            receipts_per_request: 16,
+            request_timeout_ms: 4000,
+            log_flush_ms: 1000,
+            log_flush_lines: 200,
+            quiet: false,
+            peer_failure_threshold: 5,
+            peer_ban_secs: 120,
+            max_attempts: 3,
+            stats_interval_secs: 10,
         }
     }
-    None
+}
+
+impl CliConfig {
+    fn parse() -> Self {
+        let mut config = Self::default();
+        let mut args = std::env::args().skip(1);
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--run-secs" => config.run_secs = parse_u64_arg(&mut args),
+                "--max-outbound" => config.max_outbound = parse_usize_arg(&mut args, config.max_outbound),
+                "--max-concurrent-dials" => {
+                    config.max_concurrent_dials = parse_usize_arg(&mut args, config.max_concurrent_dials)
+                }
+                "--refill-interval-ms" => {
+                    config.refill_interval_ms = parse_u64_arg(&mut args).unwrap_or(config.refill_interval_ms)
+                }
+                "--max-inbound" => config.max_inbound = parse_optional_usize_arg(&mut args),
+                "--blocks-per-assignment" => {
+                    config.blocks_per_assignment = parse_usize_arg(&mut args, config.blocks_per_assignment)
+                }
+                "--receipts-per-request" => {
+                    config.receipts_per_request = parse_usize_arg(&mut args, config.receipts_per_request)
+                }
+                "--request-timeout-ms" => {
+                    config.request_timeout_ms = parse_u64_arg(&mut args).unwrap_or(config.request_timeout_ms)
+                }
+                "--log-flush-ms" => {
+                    config.log_flush_ms = parse_u64_arg(&mut args).unwrap_or(config.log_flush_ms)
+                }
+                "--log-flush-lines" => {
+                    config.log_flush_lines = parse_usize_arg(&mut args, config.log_flush_lines)
+                }
+                "--peer-failure-threshold" => {
+                    config.peer_failure_threshold = parse_u32_arg(&mut args, config.peer_failure_threshold)
+                }
+                "--peer-ban-secs" => {
+                    config.peer_ban_secs = parse_u64_arg(&mut args).unwrap_or(config.peer_ban_secs)
+                }
+                "--max-attempts" => config.max_attempts = parse_u32_arg(&mut args, config.max_attempts),
+                "--stats-interval-secs" => {
+                    config.stats_interval_secs = parse_u64_arg(&mut args).unwrap_or(config.stats_interval_secs)
+                }
+                "--quiet" => config.quiet = true,
+                _ => {
+                    if let Some(value) = arg.strip_prefix("--run-secs=") {
+                        config.run_secs = value.parse().ok();
+                    } else if let Some(value) = arg.strip_prefix("--max-outbound=") {
+                        config.max_outbound = value.parse().unwrap_or(config.max_outbound);
+                    } else if let Some(value) = arg.strip_prefix("--max-concurrent-dials=") {
+                        config.max_concurrent_dials = value.parse().unwrap_or(config.max_concurrent_dials);
+                    } else if let Some(value) = arg.strip_prefix("--refill-interval-ms=") {
+                        config.refill_interval_ms = value.parse().unwrap_or(config.refill_interval_ms);
+                    } else if let Some(value) = arg.strip_prefix("--max-inbound=") {
+                        config.max_inbound = value.parse().ok();
+                    } else if let Some(value) = arg.strip_prefix("--blocks-per-assignment=") {
+                        config.blocks_per_assignment = value.parse().unwrap_or(config.blocks_per_assignment);
+                    } else if let Some(value) = arg.strip_prefix("--receipts-per-request=") {
+                        config.receipts_per_request = value.parse().unwrap_or(config.receipts_per_request);
+                    } else if let Some(value) = arg.strip_prefix("--request-timeout-ms=") {
+                        config.request_timeout_ms = value.parse().unwrap_or(config.request_timeout_ms);
+                    } else if let Some(value) = arg.strip_prefix("--log-flush-ms=") {
+                        config.log_flush_ms = value.parse().unwrap_or(config.log_flush_ms);
+                    } else if let Some(value) = arg.strip_prefix("--log-flush-lines=") {
+                        config.log_flush_lines = value.parse().unwrap_or(config.log_flush_lines);
+                    } else if let Some(value) = arg.strip_prefix("--peer-failure-threshold=") {
+                        config.peer_failure_threshold =
+                            value.parse().unwrap_or(config.peer_failure_threshold);
+                    } else if let Some(value) = arg.strip_prefix("--peer-ban-secs=") {
+                        config.peer_ban_secs = value.parse().unwrap_or(config.peer_ban_secs);
+                    } else if let Some(value) = arg.strip_prefix("--max-attempts=") {
+                        config.max_attempts = value.parse().unwrap_or(config.max_attempts);
+                    } else if let Some(value) = arg.strip_prefix("--stats-interval-secs=") {
+                        config.stats_interval_secs = value.parse().unwrap_or(config.stats_interval_secs);
+                    }
+                }
+            }
+        }
+        config
+    }
+}
+
+fn parse_u64_arg<I: Iterator<Item = String>>(args: &mut I) -> Option<u64> {
+    args.next().and_then(|value| value.parse().ok())
+}
+
+fn parse_usize_arg<I: Iterator<Item = String>>(args: &mut I, fallback: usize) -> usize {
+    args.next().and_then(|value| value.parse().ok()).unwrap_or(fallback)
+}
+
+fn parse_u32_arg<I: Iterator<Item = String>>(args: &mut I, fallback: u32) -> u32 {
+    args.next().and_then(|value| value.parse().ok()).unwrap_or(fallback)
+}
+
+fn parse_optional_usize_arg<I: Iterator<Item = String>>(args: &mut I) -> Option<usize> {
+    args.next().and_then(|value| value.parse().ok())
 }
 
 async fn request_head_number(
@@ -282,9 +441,29 @@ async fn request_head_number(
         .try_send(PeerRequest::GetBlockHeaders { request, response: tx })
         .map_err(|err| format!("send error: {err:?}"))?;
 
-    let response = rx
-        .await
-        .map_err(|err| format!("response dropped: {err:?}"))?;
+    let response =
+        match tokio::time::timeout(Duration::from_millis(context.config.request_timeout_ms), rx)
+            .await
+        {
+            Ok(inner) => inner.map_err(|err| format!("response dropped: {err:?}"))?,
+            Err(_) => {
+                let received_at = now_ms();
+                let duration_ms = received_at.saturating_sub(sent_at);
+                context
+                    .log_request(json!({
+                        "event": "response_err",
+                        "request_id": request_id,
+                        "peer_id": format!("{:?}", peer_id),
+                        "kind": "head_header",
+                        "eth_version": format!("{eth_version}"),
+                        "received_at_ms": received_at,
+                        "duration_ms": duration_ms,
+                        "error": "timeout",
+                    }))
+                    .await;
+                return Err("timeout".to_string());
+            }
+        };
 
     let received_at = now_ms();
     let duration_ms = received_at.saturating_sub(sent_at);
@@ -330,7 +509,7 @@ async fn request_head_number(
 }
 
 fn build_anchor_targets() -> Vec<u64> {
-    const ANCHOR_WINDOW: u64 = 1_000;
+    const ANCHOR_WINDOW: u64 = 10_000;
     const ANCHORS: [u64; 5] = [10_000_835, 11_362_579, 12_369_621, 16_291_127, 21_688_329];
 
     let mut targets = Vec::new();
@@ -345,202 +524,313 @@ fn build_anchor_targets() -> Vec<u64> {
     targets
 }
 
-async fn probe_block(
+async fn probe_block_batch(
     peer_id: PeerId,
     peer_key: String,
     messages: PeerRequestSender<PeerRequest<EthNetworkPrimitives>>,
     eth_version: EthVersion,
-    block_number: u64,
+    blocks: Vec<u64>,
     context: Arc<RunContext>,
-) {
+) -> bool {
+    if blocks.is_empty() {
+        return true;
+    }
     let header_start = Instant::now();
-    let header =
-        match request_header(peer_id, eth_version, &messages, block_number, context.as_ref()).await
-    {
-        Ok(header) => header,
+    let header_result = request_headers_batch(
+        peer_id,
+        eth_version,
+        &messages,
+        blocks[0],
+        blocks.len(),
+        context.as_ref(),
+    )
+    .await;
+    let header_ms = header_start.elapsed().as_millis();
+
+    let headers = match header_result {
+        Ok(headers) => {
+            context.record_peer_success(&peer_key).await;
+            headers
+        }
         Err(err) => {
-            let header_ms = header_start.elapsed().as_millis();
+            let peer_banned = context
+                .handle_peer_failure(peer_id, &peer_key, "header")
+                .await;
+            warn!(
+                peer_id = ?peer_id,
+                block_start = blocks[0],
+                block_count = blocks.len(),
+                header_ms,
+                error = %err,
+                "probe header batch failed"
+            );
+            for block in &blocks {
+                let attempt = context.record_attempt(*block).await;
+                let retry = attempt <= context.config.max_attempts;
+                if retry {
+                    context.requeue_blocks(&[*block]).await;
+                }
+                context
+                    .stats
+                    .lock()
+                    .await
+                    .record_probe(*block, false, false, header_ms, None);
+                context
+                    .update_window(&peer_key, header_ms, None, false)
+                    .await;
+                let payload = json!({
+                    "event": "probe",
+                    "peer_id": format!("{:?}", peer_id),
+                    "block": block,
+                    "eth_version": format!("{eth_version}"),
+                    "header_ok": false,
+                    "receipts_ok": false,
+                    "header_ms": header_ms,
+                    "attempt": attempt,
+                    "will_retry": retry,
+                    "error": err,
+                });
+                if !context.config.quiet {
+                    println!("{}", payload);
+                }
+                context.log_probe(payload).await;
+            }
+            return !peer_banned;
+        }
+    };
+
+    let mut headers_by_number = HashMap::new();
+    for header in headers {
+        headers_by_number.insert(header.number, header);
+    }
+
+    let mut hashes = Vec::new();
+    let mut missing = Vec::new();
+    for block in &blocks {
+        match headers_by_number.remove(block) {
+            Some(header) => {
+                if header.number != *block {
+                    warn!(
+                        peer_id = ?peer_id,
+                        requested = block,
+                        received = header.number,
+                        "probe header mismatch"
+                    );
+                }
+                let hash = SealedHeader::seal_slow(header).hash();
+                hashes.push((*block, hash));
+            }
+            None => missing.push(*block),
+        }
+    }
+
+    if !missing.is_empty() {
+        warn!(
+            peer_id = ?peer_id,
+            missing = missing.len(),
+            "probe header missing in batch"
+        );
+        for block in &missing {
+            let attempt = context.record_attempt(*block).await;
+            let retry = attempt <= context.config.max_attempts;
+            if retry {
+                context.requeue_blocks(&[*block]).await;
+            }
             context
                 .stats
                 .lock()
                 .await
-                .record_probe(block_number, false, false, header_ms, None);
-            if let Some(ban) = context.record_peer_failure(&peer_key).await {
-                context
-                    .log_request(json!({
-                        "event": "peer_ban",
-                        "peer_id": peer_key,
-                        "reason": "header",
-                        "ban_secs": ban.ban_secs,
-                        "failures": ban.failures,
-                        "at_ms": now_ms(),
-                    }))
-                    .await;
-                warn!(
-                    peer_id = ?peer_id,
-                    ban_secs = ban.ban_secs,
-                    failures = ban.failures,
-                    "peer temporarily banned"
-                );
-            }
-            warn!(
-                peer_id = ?peer_id,
-                block = block_number,
-                header_ms,
-                error = %err,
-                "probe header failed"
-            );
+                .record_probe(*block, false, false, header_ms, None);
+            context
+                .update_window(&peer_key, header_ms, None, false)
+                .await;
+            context
+                .update_window(&peer_key, header_ms, None, false)
+                .await;
             let payload = json!({
                 "event": "probe",
                 "peer_id": format!("{:?}", peer_id),
-                "block": block_number,
+                "block": block,
                 "eth_version": format!("{eth_version}"),
                 "header_ok": false,
                 "receipts_ok": false,
                 "header_ms": header_ms,
-                "error": err,
+                "attempt": attempt,
+                "will_retry": retry,
+                "error": "missing_header",
             });
-            println!("{}", payload);
+            if !context.config.quiet {
+                println!("{}", payload);
+            }
             context.log_probe(payload).await;
-            return;
         }
-    };
-    let header_ms = header_start.elapsed().as_millis();
-
-    if header.number != block_number {
-        warn!(
-            peer_id = ?peer_id,
-            requested = block_number,
-            received = header.number,
-            "probe header mismatch"
-        );
     }
 
-    let block_hash: B256 = SealedHeader::seal_slow(header).hash();
-    let receipts_start = Instant::now();
-    let receipts_result = match eth_version {
-        EthVersion::Eth69 => {
-            request_receipts69(
-                peer_id,
-                eth_version,
-                &messages,
-                block_hash,
-                context.as_ref(),
-                block_number,
-            )
+    for chunk in hashes.chunks(context.config.receipts_per_request.max(1)) {
+        let chunk_blocks: Vec<u64> = chunk.iter().map(|(block, _)| *block).collect();
+        let chunk_hashes: Vec<B256> = chunk.iter().map(|(_, hash)| *hash).collect();
+        let receipts_start = Instant::now();
+        let receipts_result = match eth_version {
+            EthVersion::Eth69 => {
+                request_receipts69(
+                    peer_id,
+                    eth_version,
+                    &messages,
+                    &chunk_blocks,
+                    &chunk_hashes,
+                    context.as_ref(),
+                )
                 .await
-        }
-        EthVersion::Eth70 => {
-            request_receipts70(
-                peer_id,
-                eth_version,
-                &messages,
-                block_hash,
-                context.as_ref(),
-                block_number,
-            )
+            }
+            EthVersion::Eth70 => {
+                request_receipts70(
+                    peer_id,
+                    eth_version,
+                    &messages,
+                    &chunk_blocks,
+                    &chunk_hashes,
+                    context.as_ref(),
+                )
                 .await
-        }
-        _ => {
-            request_receipts_legacy(
-                peer_id,
-                eth_version,
-                &messages,
-                block_hash,
-                context.as_ref(),
-                block_number,
-            )
+            }
+            _ => {
+                request_receipts_legacy(
+                    peer_id,
+                    eth_version,
+                    &messages,
+                    &chunk_blocks,
+                    &chunk_hashes,
+                    context.as_ref(),
+                )
                 .await
-        }
-    };
-    let receipts_ms = receipts_start.elapsed().as_millis();
+            }
+        };
+        let receipts_ms = receipts_start.elapsed().as_millis();
 
-    match receipts_result {
-        Ok(receipt_count) => {
-            context
-                .stats
-                .lock()
-                .await
-                .record_probe(block_number, true, true, header_ms, Some(receipts_ms));
-            context.record_peer_success(&peer_key).await;
-            context.mark_known_block(block_number).await;
-            info!(
-                peer_id = ?peer_id,
-                block = block_number,
-                header_ms,
-                receipts_ms,
-                receipts = receipt_count,
-                "probe result"
-            );
-            let payload = json!({
-                "event": "probe",
-                "peer_id": format!("{:?}", peer_id),
-                "block": block_number,
-                "eth_version": format!("{eth_version}"),
-                "header_ok": true,
-                "receipts_ok": true,
-                "header_ms": header_ms,
-                "receipts_ms": receipts_ms,
-                "receipts": receipt_count,
-            });
-            println!("{}", payload);
-            context.log_probe(payload).await;
-        }
-        Err(err) => {
-            context
-                .stats
-                .lock()
-                .await
-                .record_probe(block_number, true, false, header_ms, Some(receipts_ms));
-            if let Some(ban) = context.record_peer_failure(&peer_key).await {
-                context
-                    .log_request(json!({
-                        "event": "peer_ban",
-                        "peer_id": peer_key,
-                        "reason": "receipts",
-                        "ban_secs": ban.ban_secs,
-                        "failures": ban.failures,
-                        "at_ms": now_ms(),
-                    }))
+        match receipts_result {
+            Ok(counts) => {
+                context.record_peer_success(&peer_key).await;
+                for (idx, block) in chunk_blocks.iter().enumerate() {
+                    if let Some(receipt_count) = counts.get(idx).copied() {
+                        context
+                            .stats
+                            .lock()
+                            .await
+                            .record_probe(*block, true, true, header_ms, Some(receipts_ms));
+                        context
+                            .update_window(&peer_key, header_ms, Some(receipts_ms), true)
+                            .await;
+                        context.mark_known_block(*block).await;
+                        let payload = json!({
+                            "event": "probe",
+                            "peer_id": format!("{:?}", peer_id),
+                            "block": block,
+                            "eth_version": format!("{eth_version}"),
+                            "header_ok": true,
+                            "receipts_ok": true,
+                            "header_ms": header_ms,
+                            "receipts_ms": receipts_ms,
+                            "receipts": receipt_count,
+                        });
+                        if !context.config.quiet {
+                            println!("{}", payload);
+                        }
+                        context.log_probe(payload).await;
+                    } else {
+                        let attempt = context.record_attempt(*block).await;
+                        let retry = attempt <= context.config.max_attempts;
+                        if retry {
+                            context.requeue_blocks(&[*block]).await;
+                        }
+                        context
+                            .stats
+                            .lock()
+                            .await
+                            .record_probe(*block, true, false, header_ms, Some(receipts_ms));
+                        context
+                            .update_window(&peer_key, header_ms, Some(receipts_ms), false)
+                            .await;
+                        let payload = json!({
+                            "event": "probe",
+                            "peer_id": format!("{:?}", peer_id),
+                            "block": block,
+                            "eth_version": format!("{eth_version}"),
+                            "header_ok": true,
+                            "receipts_ok": false,
+                            "header_ms": header_ms,
+                            "receipts_ms": receipts_ms,
+                            "attempt": attempt,
+                            "will_retry": retry,
+                            "error": "receipt_count_missing",
+                        });
+                        if !context.config.quiet {
+                            println!("{}", payload);
+                        }
+                        context.log_probe(payload).await;
+                    }
+                }
+            }
+            Err(err) => {
+                let peer_banned = context
+                    .handle_peer_failure(peer_id, &peer_key, "receipts")
                     .await;
                 warn!(
                     peer_id = ?peer_id,
-                    ban_secs = ban.ban_secs,
-                    failures = ban.failures,
-                    "peer temporarily banned"
+                    blocks = chunk_blocks.len(),
+                    header_ms,
+                    receipts_ms,
+                    error = %err,
+                    "receipts batch failed"
                 );
+                for block in &chunk_blocks {
+                    let attempt = context.record_attempt(*block).await;
+                    let retry = attempt <= context.config.max_attempts;
+                    if retry {
+                        context.requeue_blocks(&[*block]).await;
+                    }
+                    context
+                        .stats
+                        .lock()
+                        .await
+                        .record_probe(*block, true, false, header_ms, Some(receipts_ms));
+                    context
+                        .update_window(&peer_key, header_ms, Some(receipts_ms), false)
+                        .await;
+                    let payload = json!({
+                        "event": "probe",
+                        "peer_id": format!("{:?}", peer_id),
+                        "block": block,
+                        "eth_version": format!("{eth_version}"),
+                        "header_ok": true,
+                        "receipts_ok": false,
+                        "header_ms": header_ms,
+                        "receipts_ms": receipts_ms,
+                        "attempt": attempt,
+                        "will_retry": retry,
+                        "error": err,
+                    });
+                    if !context.config.quiet {
+                        println!("{}", payload);
+                    }
+                    context.log_probe(payload).await;
+                }
+                if peer_banned {
+                    return false;
+                }
             }
-            warn!(
-                peer_id = ?peer_id,
-                block = block_number,
-                header_ms,
-                error = %err,
-                "receipts request failed"
-            );
-            let payload = json!({
-                "event": "probe",
-                "peer_id": format!("{:?}", peer_id),
-                "block": block_number,
-                "eth_version": format!("{eth_version}"),
-                "header_ok": true,
-                "receipts_ok": false,
-                "header_ms": header_ms,
-                "receipts_ms": receipts_ms,
-                "error": err,
-            });
-            println!("{}", payload);
-            context.log_probe(payload).await;
         }
     }
+    true
 }
 
-async fn request_header(
+async fn request_headers_batch(
     peer_id: PeerId,
     eth_version: EthVersion,
     messages: &PeerRequestSender<PeerRequest<EthNetworkPrimitives>>,
-    block_number: u64,
+    start_block: u64,
+    limit: usize,
     context: &RunContext,
-) -> Result<Header, String> {
+) -> Result<Vec<Header>, String> {
     let request_id = context.next_request_id();
     let sent_at = now_ms();
     context
@@ -548,16 +838,17 @@ async fn request_header(
             "event": "request_sent",
             "request_id": request_id,
             "peer_id": format!("{:?}", peer_id),
-            "block": block_number,
-            "kind": "header",
+            "block_start": start_block,
+            "block_count": limit,
+            "kind": "headers",
             "eth_version": format!("{eth_version}"),
             "sent_at_ms": sent_at,
         }))
         .await;
 
     let request = GetBlockHeaders {
-        start_block: BlockHashOrNumber::Number(block_number),
-        limit: 1,
+        start_block: BlockHashOrNumber::Number(start_block),
+        limit: limit as u64,
         skip: 0,
         direction: HeadersDirection::Rising,
     };
@@ -566,34 +857,52 @@ async fn request_header(
         .try_send(PeerRequest::GetBlockHeaders { request, response: tx })
         .map_err(|err| format!("send error: {err:?}"))?;
 
-    let response = rx
-        .await
-        .map_err(|err| format!("response dropped: {err:?}"))?;
+    let response =
+        match tokio::time::timeout(Duration::from_millis(context.config.request_timeout_ms), rx)
+            .await
+        {
+            Ok(inner) => inner.map_err(|err| format!("response dropped: {err:?}"))?,
+            Err(_) => {
+                let received_at = now_ms();
+                let duration_ms = received_at.saturating_sub(sent_at);
+                context
+                    .log_request(json!({
+                        "event": "response_err",
+                        "request_id": request_id,
+                        "peer_id": format!("{:?}", peer_id),
+                        "block_start": start_block,
+                        "block_count": limit,
+                        "kind": "headers",
+                        "eth_version": format!("{eth_version}"),
+                        "received_at_ms": received_at,
+                        "duration_ms": duration_ms,
+                        "error": "timeout",
+                    }))
+                    .await;
+                return Err("timeout".to_string());
+            }
+        };
 
     let received_at = now_ms();
     let duration_ms = received_at.saturating_sub(sent_at);
 
     match response {
         Ok(headers) => {
-            let header = headers
-                .0
-                .first()
-                .cloned()
-                .ok_or_else(|| "empty header response".to_string())?;
             context
                 .log_request(json!({
                     "event": "response_ok",
                     "request_id": request_id,
                     "peer_id": format!("{:?}", peer_id),
-                    "block": block_number,
-                    "kind": "header",
+                    "block_start": start_block,
+                    "block_count": limit,
+                    "kind": "headers",
                     "eth_version": format!("{eth_version}"),
                     "received_at_ms": received_at,
                     "duration_ms": duration_ms,
                     "items": headers.0.len(),
                 }))
                 .await;
-            Ok(header)
+            Ok(headers.0)
         }
         Err(err) => {
             context
@@ -601,8 +910,9 @@ async fn request_header(
                     "event": "response_err",
                     "request_id": request_id,
                     "peer_id": format!("{:?}", peer_id),
-                    "block": block_number,
-                    "kind": "header",
+                    "block_start": start_block,
+                    "block_count": limit,
+                    "kind": "headers",
                     "eth_version": format!("{eth_version}"),
                     "received_at_ms": received_at,
                     "duration_ms": duration_ms,
@@ -614,42 +924,86 @@ async fn request_header(
     }
 }
 
+struct LogWriter {
+    writer: BufWriter<File>,
+    lines_since_flush: usize,
+}
+
+type SharedLogWriter = Arc<Mutex<LogWriter>>;
+
 struct Logger {
-    requests: Mutex<BufWriter<File>>,
-    probes: Mutex<BufWriter<File>>,
-    known: Mutex<BufWriter<File>>,
+    requests: SharedLogWriter,
+    probes: SharedLogWriter,
+    known: SharedLogWriter,
+    stats: SharedLogWriter,
+    flush_every_lines: usize,
 }
 
 impl Logger {
-    fn new(out_dir: &PathBuf) -> std::io::Result<Self> {
+    fn new(out_dir: &PathBuf, flush_every_lines: usize) -> std::io::Result<Self> {
         let requests = open_log(out_dir.join("requests.jsonl"))?;
         let probes = open_log(out_dir.join("probes.jsonl"))?;
         let known = open_log(out_dir.join("known_blocks.jsonl"))?;
-        Ok(Self { requests, probes, known })
+        let stats = open_log(out_dir.join("stats.jsonl"))?;
+        Ok(Self {
+            requests,
+            probes,
+            known,
+            stats,
+            flush_every_lines: flush_every_lines.max(1),
+        })
+    }
+
+    fn spawn_flush_tasks(&self, interval: Duration) {
+        spawn_flush_task(self.requests.clone(), interval);
+        spawn_flush_task(self.probes.clone(), interval);
+        spawn_flush_task(self.known.clone(), interval);
+        spawn_flush_task(self.stats.clone(), interval);
+    }
+
+    async fn flush_all(&self) {
+        flush_writer(&self.requests).await;
+        flush_writer(&self.probes).await;
+        flush_writer(&self.known).await;
+        flush_writer(&self.stats).await;
     }
 
     async fn log_request(&self, value: serde_json::Value) {
-        write_json_line(&self.requests, value).await;
+        write_json_line(&self.requests, self.flush_every_lines, value).await;
     }
 
     async fn log_probe(&self, value: serde_json::Value) {
-        write_json_line(&self.probes, value).await;
+        write_json_line(&self.probes, self.flush_every_lines, value).await;
     }
 
     async fn log_known(&self, block: u64) {
-        write_json_line(&self.known, json!({
-            "block": block,
-            "at_ms": now_ms(),
-        }))
+        write_json_line(
+            &self.known,
+            self.flush_every_lines,
+            json!({
+                "block": block,
+                "at_ms": now_ms(),
+            }),
+        )
         .await;
+    }
+
+    async fn log_stats(&self, value: serde_json::Value) {
+        write_json_line(&self.stats, self.flush_every_lines, value).await;
     }
 }
 
 struct RunContext {
     stats: Mutex<Stats>,
-    queue: Mutex<VecDeque<u64>>,
+    queue: Mutex<BinaryHeap<Reverse<u64>>>,
+    queued_blocks: Mutex<HashSet<u64>>,
     known_blocks: Mutex<HashSet<u64>>,
+    attempts: Mutex<HashMap<u64, u32>>,
     peer_health: Mutex<HashMap<String, PeerHealth>>,
+    active_peers: Mutex<HashSet<String>>,
+    window: Mutex<WindowStats>,
+    config: CliConfig,
+    peers_handle: PeersHandle,
     logger: Logger,
     request_id: AtomicU64,
 }
@@ -659,13 +1013,33 @@ impl RunContext {
         self.request_id.fetch_add(1, Ordering::SeqCst)
     }
 
-    async fn pop_next_block_for_head(&self, head_number: u64) -> Option<u64> {
+    async fn pop_next_batch_for_head(&self, head_number: u64) -> Vec<u64> {
+        let mut queued = self.queued_blocks.lock().await;
         let mut queue = self.queue.lock().await;
-        let next = queue.front().copied();
-        match next {
-            Some(block) if block <= head_number => queue.pop_front(),
-            _ => None,
+        let mut batch = Vec::new();
+        let mut last = None;
+        while let Some(Reverse(next)) = queue.peek().copied() {
+            if next > head_number {
+                break;
+            }
+            if batch.len() >= self.config.blocks_per_assignment {
+                break;
+            }
+            if let Some(prev) = last {
+                if next != prev + 1 {
+                    break;
+                }
+            }
+            queue.pop();
+            queued.remove(&next);
+            batch.push(next);
+            last = Some(next);
         }
+        batch
+    }
+
+    async fn queue_len(&self) -> usize {
+        self.queue.lock().await.len()
     }
 
     async fn log_request(&self, value: serde_json::Value) {
@@ -681,6 +1055,24 @@ impl RunContext {
         if known.insert(block) {
             self.logger.log_known(block).await;
         }
+        let mut attempts = self.attempts.lock().await;
+        attempts.remove(&block);
+    }
+
+    async fn record_active_peer(&self, peer_key: String) {
+        let mut active = self.active_peers.lock().await;
+        active.insert(peer_key);
+    }
+
+    async fn update_window(
+        &self,
+        peer_key: &str,
+        header_ms: u128,
+        receipts_ms: Option<u128>,
+        receipts_ok: bool,
+    ) {
+        let mut window = self.window.lock().await;
+        window.record(peer_key, header_ms, receipts_ms, receipts_ok);
     }
 
     async fn peer_ban_remaining(&self, peer_key: &str) -> Option<Duration> {
@@ -703,11 +1095,14 @@ impl RunContext {
         let mut health = self.peer_health.lock().await;
         let entry = health.entry(peer_key.to_string()).or_default();
         entry.consecutive_failures += 1;
-        if entry.consecutive_failures >= PEER_FAILURE_THRESHOLD {
+        if entry.consecutive_failures >= self.config.peer_failure_threshold {
             let failures = entry.consecutive_failures;
             entry.consecutive_failures = 0;
-            entry.ban_until = Some(Instant::now() + Duration::from_secs(PEER_BAN_SECS));
-            return Some(PeerBan { ban_secs: PEER_BAN_SECS, failures });
+            entry.ban_until = Some(Instant::now() + Duration::from_secs(self.config.peer_ban_secs));
+            return Some(PeerBan {
+                ban_secs: self.config.peer_ban_secs,
+                failures,
+            });
         }
         None
     }
@@ -719,6 +1114,48 @@ impl RunContext {
             entry.ban_until = None;
         }
     }
+
+    async fn handle_peer_failure(&self, peer_id: PeerId, peer_key: &str, reason: &str) -> bool {
+        if let Some(ban) = self.record_peer_failure(peer_key).await {
+            self.log_request(json!({
+                "event": "peer_ban",
+                "peer_id": peer_key,
+                "reason": reason,
+                "ban_secs": ban.ban_secs,
+                "failures": ban.failures,
+                "at_ms": now_ms(),
+            }))
+            .await;
+            self.peers_handle.remove_peer(peer_id);
+            warn!(
+                peer_id = ?peer_id,
+                ban_secs = ban.ban_secs,
+                failures = ban.failures,
+                reason = reason,
+                "peer temporarily banned"
+            );
+            return true;
+        }
+        false
+    }
+
+    async fn record_attempt(&self, block: u64) -> u32 {
+        let mut attempts = self.attempts.lock().await;
+        let entry = attempts.entry(block).or_insert(0);
+        *entry += 1;
+        *entry
+    }
+
+    async fn requeue_blocks(&self, blocks: &[u64]) {
+        let known = self.known_blocks.lock().await;
+        let mut queued = self.queued_blocks.lock().await;
+        let mut queue = self.queue.lock().await;
+        for block in blocks {
+            if !known.contains(block) && queued.insert(*block) {
+                queue.push(Reverse(*block));
+            }
+        }
+    }
 }
 
 fn now_ms() -> u64 {
@@ -728,19 +1165,48 @@ fn now_ms() -> u64 {
         .unwrap_or_default()
 }
 
-fn open_log(path: PathBuf) -> std::io::Result<Mutex<BufWriter<File>>> {
+fn open_log(path: PathBuf) -> std::io::Result<SharedLogWriter> {
     let file = OpenOptions::new().create(true).append(true).open(path)?;
-    Ok(Mutex::new(BufWriter::new(file)))
+    Ok(Arc::new(Mutex::new(LogWriter {
+        writer: BufWriter::new(file),
+        lines_since_flush: 0,
+    })))
 }
 
-async fn write_json_line(writer: &Mutex<BufWriter<File>>, value: serde_json::Value) {
+async fn write_json_line(
+    writer: &SharedLogWriter,
+    flush_every_lines: usize,
+    value: serde_json::Value,
+) {
     let mut guard = writer.lock().await;
-    if let Err(err) = writeln!(guard, "{value}") {
+    if let Err(err) = writeln!(guard.writer, "{value}") {
         warn!(error = ?err, "failed to write log line");
     }
-    if let Err(err) = guard.flush() {
+    guard.lines_since_flush += 1;
+    if guard.lines_since_flush >= flush_every_lines {
+        if let Err(err) = guard.writer.flush() {
+            warn!(error = ?err, "failed to flush log");
+        }
+        guard.lines_since_flush = 0;
+    }
+}
+
+async fn flush_writer(writer: &SharedLogWriter) {
+    let mut guard = writer.lock().await;
+    if let Err(err) = guard.writer.flush() {
         warn!(error = ?err, "failed to flush log");
     }
+    guard.lines_since_flush = 0;
+}
+
+fn spawn_flush_task(writer: SharedLogWriter, interval: Duration) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        loop {
+            ticker.tick().await;
+            flush_writer(&writer).await;
+        }
+    });
 }
 
 fn load_known_blocks(path: &PathBuf) -> HashSet<u64> {
@@ -770,8 +1236,6 @@ struct PeerHandle {
 }
 
 const WARMUP_SECS: u64 = 3;
-const PEER_FAILURE_THRESHOLD: u32 = 5;
-const PEER_BAN_SECS: u64 = 120;
 
 #[derive(Default)]
 struct PeerHealth {
@@ -782,6 +1246,56 @@ struct PeerHealth {
 struct PeerBan {
     ban_secs: u64,
     failures: u32,
+}
+
+#[derive(Default)]
+struct WindowStats {
+    blocks_total: u64,
+    blocks_ok: u64,
+    header_ms: Vec<u128>,
+    receipts_ms: Vec<u128>,
+    peers: HashSet<String>,
+}
+
+impl WindowStats {
+    fn record(
+        &mut self,
+        peer_key: &str,
+        header_ms: u128,
+        receipts_ms: Option<u128>,
+        receipts_ok: bool,
+    ) {
+        self.blocks_total += 1;
+        if receipts_ok {
+            self.blocks_ok += 1;
+        }
+        self.header_ms.push(header_ms);
+        if let Some(ms) = receipts_ms {
+            self.receipts_ms.push(ms);
+        }
+        self.peers.insert(peer_key.to_string());
+    }
+
+    fn take_snapshot(&mut self) -> WindowSnapshot {
+        let snapshot = WindowSnapshot {
+            blocks_total: self.blocks_total,
+            blocks_ok: self.blocks_ok,
+            header_ms: std::mem::take(&mut self.header_ms),
+            receipts_ms: std::mem::take(&mut self.receipts_ms),
+            peers: std::mem::take(&mut self.peers),
+        };
+        self.blocks_total = 0;
+        self.blocks_ok = 0;
+        snapshot
+    }
+}
+
+struct WindowSnapshot {
+    blocks_total: u64,
+    blocks_ok: u64,
+    header_ms: Vec<u128>,
+    receipts_ms: Vec<u128>,
+    peers: HashSet<String>,
 }
 
 #[derive(Default)]
@@ -834,7 +1348,7 @@ impl Stats {
 async fn summarize_stats(stats: &Mutex<Stats>, elapsed: Duration) -> serde_json::Value {
     let stats = stats.lock().await;
     let elapsed_secs = elapsed.as_secs_f64().max(0.001);
-    let throughput = stats.receipts_ok_total as f64 / elapsed_secs;
+    let throughput_blocks = stats.receipts_ok_total as f64 / elapsed_secs;
     let mut blocks: Vec<_> = stats.by_block.iter().map(|(block, stats)| {
         let header_rate = if stats.total > 0 {
             stats.header_ok as f64 / stats.total as f64
@@ -875,20 +1389,75 @@ async fn summarize_stats(stats: &Mutex<Stats>, elapsed: Duration) -> serde_json:
         "duration_secs": elapsed_secs,
         "total_probes": stats.total_probes,
         "receipts_ok_total": stats.receipts_ok_total,
-        "throughput_receipts_per_sec": throughput,
+        "blocks_ok_total": stats.receipts_ok_total,
+        "throughput_blocks_per_sec": throughput_blocks,
         "peers": stats.clients,
         "by_block": blocks,
     })
+}
+
+fn spawn_window_stats(context: Arc<RunContext>) {
+    if context.config.stats_interval_secs == 0 {
+        return;
+    }
+    let interval = Duration::from_secs(context.config.stats_interval_secs);
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        loop {
+            ticker.tick().await;
+            let queue_len = context.queue_len().await;
+            let active_peers = context.active_peers.lock().await.len();
+            let mut window = context.window.lock().await;
+            let snapshot = window.take_snapshot();
+            drop(window);
+            let mut header_ms = snapshot.header_ms;
+            let mut receipts_ms = snapshot.receipts_ms;
+            let header_p50 = percentile(&mut header_ms, 0.50);
+            let header_p95 = percentile(&mut header_ms, 0.95);
+            let receipts_p50 = percentile(&mut receipts_ms, 0.50);
+            let receipts_p95 = percentile(&mut receipts_ms, 0.95);
+            let window_secs = interval.as_secs_f64().max(0.001);
+            let probes_per_sec = snapshot.blocks_total as f64 / window_secs;
+            let blocks_per_sec = snapshot.blocks_ok as f64 / window_secs;
+            let payload = json!({
+                "event": "window_stats",
+                "interval_secs": interval.as_secs(),
+                "queue_len": queue_len,
+                "active_peers_total": active_peers,
+                "active_peers_window": snapshot.peers.len(),
+                "probes_per_sec": probes_per_sec,
+                "blocks_per_sec": blocks_per_sec,
+                "header_p50_ms": header_p50,
+                "header_p95_ms": header_p95,
+                "receipts_p50_ms": receipts_p50,
+                "receipts_p95_ms": receipts_p95,
+                "at_ms": now_ms(),
+            });
+            if !context.config.quiet {
+                println!("{}", payload);
+            }
+            context.logger.log_stats(payload).await;
+        }
+    });
+}
+
+fn percentile(values: &mut Vec<u128>, percentile: f64) -> u128 {
+    if values.is_empty() {
+        return 0;
+    }
+    values.sort_unstable();
+    let idx = ((values.len() - 1) as f64 * percentile).round() as usize;
+    values[idx]
 }
 
 async fn request_receipts_legacy(
     peer_id: PeerId,
     eth_version: EthVersion,
     messages: &PeerRequestSender<PeerRequest<EthNetworkPrimitives>>,
-    block_hash: B256,
+    block_numbers: &[u64],
+    block_hashes: &[B256],
     context: &RunContext,
-    block_number: u64,
-) -> Result<usize, String> {
+) -> Result<Vec<usize>, String> {
     let request_id = context.next_request_id();
     let sent_at = now_ms();
     context
@@ -896,7 +1465,8 @@ async fn request_receipts_legacy(
             "event": "request_sent",
             "request_id": request_id,
             "peer_id": format!("{:?}", peer_id),
-            "block": block_number,
+            "block_start": block_numbers.first().copied().unwrap_or_default(),
+            "block_count": block_numbers.len(),
             "kind": "receipts",
             "variant": "legacy",
             "eth_version": format!("{eth_version}"),
@@ -904,37 +1474,61 @@ async fn request_receipts_legacy(
         }))
         .await;
 
-    let request = GetReceipts(vec![block_hash]);
+    let request = GetReceipts(block_hashes.to_vec());
     let (tx, rx) = oneshot::channel();
     messages
         .try_send(PeerRequest::GetReceipts { request, response: tx })
         .map_err(|err| format!("send error: {err:?}"))?;
 
-    let response = rx
-        .await
-        .map_err(|err| format!("response dropped: {err:?}"))?;
+    let response =
+        match tokio::time::timeout(Duration::from_millis(context.config.request_timeout_ms), rx)
+            .await
+        {
+            Ok(inner) => inner.map_err(|err| format!("response dropped: {err:?}"))?,
+            Err(_) => {
+                let received_at = now_ms();
+                let duration_ms = received_at.saturating_sub(sent_at);
+                context
+                    .log_request(json!({
+                        "event": "response_err",
+                        "request_id": request_id,
+                        "peer_id": format!("{:?}", peer_id),
+                        "block_start": block_numbers.first().copied().unwrap_or_default(),
+                        "block_count": block_numbers.len(),
+                        "kind": "receipts",
+                        "variant": "legacy",
+                        "eth_version": format!("{eth_version}"),
+                        "received_at_ms": received_at,
+                        "duration_ms": duration_ms,
+                        "error": "timeout",
+                    }))
+                    .await;
+                return Err("timeout".to_string());
+            }
+        };
 
     let received_at = now_ms();
     let duration_ms = received_at.saturating_sub(sent_at);
 
     match response {
         Ok(receipts) => {
-            let count = receipts.0.first().map(|r| r.len()).unwrap_or(0);
+            let counts: Vec<usize> = receipts.0.iter().map(|r| r.len()).collect();
             context
                 .log_request(json!({
                     "event": "response_ok",
                     "request_id": request_id,
                     "peer_id": format!("{:?}", peer_id),
-                    "block": block_number,
+                    "block_start": block_numbers.first().copied().unwrap_or_default(),
+                    "block_count": block_numbers.len(),
                     "kind": "receipts",
                     "variant": "legacy",
                     "eth_version": format!("{eth_version}"),
                     "received_at_ms": received_at,
                     "duration_ms": duration_ms,
-                    "receipts": count,
+                    "items": counts.len(),
                 }))
                 .await;
-            Ok(count)
+            Ok(counts)
         }
         Err(err) => {
             context
@@ -942,7 +1536,8 @@ async fn request_receipts_legacy(
                     "event": "response_err",
                     "request_id": request_id,
                     "peer_id": format!("{:?}", peer_id),
-                    "block": block_number,
+                    "block_start": block_numbers.first().copied().unwrap_or_default(),
+                    "block_count": block_numbers.len(),
                     "kind": "receipts",
                     "variant": "legacy",
                     "eth_version": format!("{eth_version}"),
@@ -960,10 +1555,10 @@ async fn request_receipts69(
     peer_id: PeerId,
     eth_version: EthVersion,
     messages: &PeerRequestSender<PeerRequest<EthNetworkPrimitives>>,
-    block_hash: B256,
+    block_numbers: &[u64],
+    block_hashes: &[B256],
     context: &RunContext,
-    block_number: u64,
-) -> Result<usize, String> {
+) -> Result<Vec<usize>, String> {
     let request_id = context.next_request_id();
     let sent_at = now_ms();
     context
@@ -971,7 +1566,8 @@ async fn request_receipts69(
             "event": "request_sent",
             "request_id": request_id,
             "peer_id": format!("{:?}", peer_id),
-            "block": block_number,
+            "block_start": block_numbers.first().copied().unwrap_or_default(),
+            "block_count": block_numbers.len(),
             "kind": "receipts",
             "variant": "eth69",
             "eth_version": format!("{eth_version}"),
@@ -979,37 +1575,61 @@ async fn request_receipts69(
         }))
         .await;
 
-    let request = GetReceipts(vec![block_hash]);
+    let request = GetReceipts(block_hashes.to_vec());
     let (tx, rx) = oneshot::channel();
     messages
         .try_send(PeerRequest::GetReceipts69 { request, response: tx })
         .map_err(|err| format!("send error: {err:?}"))?;
 
-    let response = rx
-        .await
-        .map_err(|err| format!("response dropped: {err:?}"))?;
+    let response =
+        match tokio::time::timeout(Duration::from_millis(context.config.request_timeout_ms), rx)
+            .await
+        {
+            Ok(inner) => inner.map_err(|err| format!("response dropped: {err:?}"))?,
+            Err(_) => {
+                let received_at = now_ms();
+                let duration_ms = received_at.saturating_sub(sent_at);
+                context
+                    .log_request(json!({
+                        "event": "response_err",
+                        "request_id": request_id,
+                        "peer_id": format!("{:?}", peer_id),
+                        "block_start": block_numbers.first().copied().unwrap_or_default(),
+                        "block_count": block_numbers.len(),
+                        "kind": "receipts",
+                        "variant": "eth69",
+                        "eth_version": format!("{eth_version}"),
+                        "received_at_ms": received_at,
+                        "duration_ms": duration_ms,
+                        "error": "timeout",
+                    }))
+                    .await;
+                return Err("timeout".to_string());
+            }
+        };
 
     let received_at = now_ms();
     let duration_ms = received_at.saturating_sub(sent_at);
 
     match response {
         Ok(Receipts69(receipts)) => {
-            let count = receipts.first().map(|r| r.len()).unwrap_or(0);
+            let counts: Vec<usize> = receipts.iter().map(|r| r.len()).collect();
             context
                 .log_request(json!({
                     "event": "response_ok",
                     "request_id": request_id,
                     "peer_id": format!("{:?}", peer_id),
-                    "block": block_number,
+                    "block_start": block_numbers.first().copied().unwrap_or_default(),
+                    "block_count": block_numbers.len(),
                     "kind": "receipts",
                     "variant": "eth69",
                     "eth_version": format!("{eth_version}"),
                     "received_at_ms": received_at,
                     "duration_ms": duration_ms,
-                    "receipts": count,
+                    "items": counts.len(),
                 }))
                 .await;
-            Ok(count)
+            Ok(counts)
         }
         Err(err) => {
             context
@@ -1017,7 +1637,8 @@ async fn request_receipts69(
                     "event": "response_err",
                     "request_id": request_id,
                     "peer_id": format!("{:?}", peer_id),
-                    "block": block_number,
+                    "block_start": block_numbers.first().copied().unwrap_or_default(),
+                    "block_count": block_numbers.len(),
                     "kind": "receipts",
                     "variant": "eth69",
                     "eth_version": format!("{eth_version}"),
@@ -1035,10 +1656,10 @@ async fn request_receipts70(
     peer_id: PeerId,
     eth_version: EthVersion,
     messages: &PeerRequestSender<PeerRequest<EthNetworkPrimitives>>,
-    block_hash: B256,
+    block_numbers: &[u64],
+    block_hashes: &[B256],
     context: &RunContext,
-    block_number: u64,
-) -> Result<usize, String> {
+) -> Result<Vec<usize>, String> {
     let request_id = context.next_request_id();
     let sent_at = now_ms();
     context
@@ -1046,7 +1667,8 @@ async fn request_receipts70(
             "event": "request_sent",
             "request_id": request_id,
             "peer_id": format!("{:?}", peer_id),
-            "block": block_number,
+            "block_start": block_numbers.first().copied().unwrap_or_default(),
+            "block_count": block_numbers.len(),
             "kind": "receipts",
             "variant": "eth70",
             "eth_version": format!("{eth_version}"),
@@ -1056,38 +1678,63 @@ async fn request_receipts70(
 
     let request = GetReceipts70 {
         first_block_receipt_index: 0,
-        block_hashes: vec![block_hash],
+        block_hashes: block_hashes.to_vec(),
     };
     let (tx, rx) = oneshot::channel();
     messages
         .try_send(PeerRequest::GetReceipts70 { request, response: tx })
         .map_err(|err| format!("send error: {err:?}"))?;
 
-    let response = rx
-        .await
-        .map_err(|err| format!("response dropped: {err:?}"))?;
+    let response =
+        match tokio::time::timeout(Duration::from_millis(context.config.request_timeout_ms), rx)
+            .await
+        {
+            Ok(inner) => inner.map_err(|err| format!("response dropped: {err:?}"))?,
+            Err(_) => {
+                let received_at = now_ms();
+                let duration_ms = received_at.saturating_sub(sent_at);
+                context
+                    .log_request(json!({
+                        "event": "response_err",
+                        "request_id": request_id,
+                        "peer_id": format!("{:?}", peer_id),
+                        "block_start": block_numbers.first().copied().unwrap_or_default(),
+                        "block_count": block_numbers.len(),
+                        "kind": "receipts",
+                        "variant": "eth70",
+                        "eth_version": format!("{eth_version}"),
+                        "received_at_ms": received_at,
+                        "duration_ms": duration_ms,
+                        "error": "timeout",
+                    }))
+                    .await;
+                return Err("timeout".to_string());
+            }
+        };
 
     let received_at = now_ms();
     let duration_ms = received_at.saturating_sub(sent_at);
 
     match response {
-        Ok(Receipts70 { receipts, .. }) => {
-            let count = receipts.first().map(|r| r.len()).unwrap_or(0);
+        Ok(Receipts70 { receipts, last_block_incomplete }) => {
+            let counts: Vec<usize> = receipts.iter().map(|r| r.len()).collect();
             context
                 .log_request(json!({
                     "event": "response_ok",
                     "request_id": request_id,
                     "peer_id": format!("{:?}", peer_id),
-                    "block": block_number,
+                    "block_start": block_numbers.first().copied().unwrap_or_default(),
+                    "block_count": block_numbers.len(),
                     "kind": "receipts",
                     "variant": "eth70",
                     "eth_version": format!("{eth_version}"),
                     "received_at_ms": received_at,
                     "duration_ms": duration_ms,
-                    "receipts": count,
+                    "items": counts.len(),
+                    "last_block_incomplete": last_block_incomplete,
                 }))
                 .await;
-            Ok(count)
+            Ok(counts)
         }
         Err(err) => {
             context
@@ -1095,7 +1742,8 @@ async fn request_receipts70(
                     "event": "response_err",
                     "request_id": request_id,
                     "peer_id": format!("{:?}", peer_id),
-                    "block": block_number,
+                    "block_start": block_numbers.first().copied().unwrap_or_default(),
+                    "block_count": block_numbers.len(),
                     "kind": "receipts",
                     "variant": "eth70",
                     "eth_version": format!("{eth_version}"),
