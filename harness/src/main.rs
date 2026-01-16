@@ -30,11 +30,20 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse()?))
-        .init();
-
     let config = CliConfig::parse();
+    let default_level = if config.quiet {
+        "error"
+    } else if config.verbosity >= Verbosity::V3 {
+        "info"
+    } else {
+        "warn"
+    };
+    let filter = if std::env::var("RUST_LOG").is_ok() {
+        EnvFilter::from_default_env()
+    } else {
+        EnvFilter::new(default_level)
+    };
+    tracing_subscriber::fmt().with_env_filter(filter).init();
     let log_flush_lines = config.log_flush_lines;
     let log_flush_ms = config.log_flush_ms;
     let run_start = Instant::now();
@@ -43,7 +52,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&out_dir)?;
     let known_path = out_dir.join("known_blocks.jsonl");
     let known_blocks = load_known_blocks(&known_path);
-    let targets = build_anchor_targets();
+    let targets = build_anchor_targets(config.anchor_window);
+    let total_targets = targets.len();
     let pending_blocks: Vec<u64> = targets
         .into_iter()
         .filter(|block| !known_blocks.contains(block))
@@ -71,6 +81,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let handle = net_config.start_network().await?;
     let peers_handle = handle.peers_handle().clone();
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
 
     let context = Arc::new(RunContext {
         stats: Mutex::new(Stats::default()),
@@ -80,11 +91,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         attempts: Mutex::new(HashMap::new()),
         peer_health: Mutex::new(HashMap::new()),
         active_peers: Mutex::new(HashSet::new()),
+        peers_with_jobs: Mutex::new(HashSet::new()),
         window: Mutex::new(WindowStats::default()),
         config,
         peers_handle,
         logger: Logger::new(&out_dir, log_flush_lines)?,
         request_id: AtomicU64::new(1),
+        total_targets,
+        discovered: AtomicU64::new(0),
+        sessions: AtomicU64::new(0),
+        jobs_assigned: AtomicU64::new(0),
+        in_flight: AtomicU64::new(0),
+        run_start,
+        shutdown_tx,
     });
     if log_flush_ms > 0 {
         context
@@ -121,6 +140,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if batch.is_empty() {
                 continue;
             }
+            scheduler_context.record_peer_job(&peer.peer_key).await;
+            scheduler_context.inc_in_flight();
 
             let context = Arc::clone(&scheduler_context);
             let ready_tx = scheduler_ready_tx.clone();
@@ -135,6 +156,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Arc::clone(&context),
                 )
                 .await;
+                context.dec_in_flight();
                 if should_requeue {
                     let _ = ready_tx.send(peer);
                 }
@@ -146,6 +168,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("receipt-harness: network started");
 
     let mut discovery_events = handle.discovery_listener();
+    let context_for_discovery = Arc::clone(&context);
     tokio::spawn(async move {
         let mut discovered = 0usize;
         while let Some(event) = discovery_events.next().await {
@@ -156,6 +179,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     fork_id,
                 }) => {
                     discovered += 1;
+                    context_for_discovery
+                        .discovered
+                        .fetch_add(1, Ordering::SeqCst);
                     info!(
                         peer_id = ?peer_id,
                         addr = ?addr,
@@ -261,16 +287,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ = tokio::signal::ctrl_c() => {},
             _ = tokio::time::sleep(Duration::from_secs(seconds)) => {
                 info!("auto-shutdown reached");
-            }
+            },
+            _ = shutdown_rx.changed() => {},
         }
     } else {
-        tokio::signal::ctrl_c().await?;
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {},
+            _ = shutdown_rx.changed() => {},
+        }
     }
 
-    let summary = summarize_stats(&context.stats, run_start.elapsed()).await;
-    println!("{}", summary);
+    let completed_blocks = context.completed_blocks().await;
+    let summary =
+        summarize_stats(&context.stats, run_start.elapsed(), context.total_targets, completed_blocks)
+            .await;
+    if !context.config.quiet && context.config.verbosity == Verbosity::Minimal {
+        println!();
+    }
+    context.logger.log_stats(summary).await;
     context.logger.flush_all().await;
     Ok(())
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Verbosity {
+    Minimal,
+    V1,
+    V2,
+    V3,
+}
+
+impl Verbosity {
+    fn from_flag(flag: &str) -> Option<Self> {
+        match flag {
+            "-v" => Some(Self::V1),
+            "-vv" => Some(Self::V2),
+            "-vvv" => Some(Self::V3),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -280,11 +335,13 @@ struct CliConfig {
     max_concurrent_dials: usize,
     refill_interval_ms: u64,
     max_inbound: Option<usize>,
+    anchor_window: u64,
     blocks_per_assignment: usize,
     receipts_per_request: usize,
     request_timeout_ms: u64,
     log_flush_ms: u64,
     log_flush_lines: usize,
+    verbosity: Verbosity,
     quiet: bool,
     peer_failure_threshold: u32,
     peer_ban_secs: u64,
@@ -300,11 +357,13 @@ impl Default for CliConfig {
             max_concurrent_dials: 100,
             refill_interval_ms: 500,
             max_inbound: None,
+            anchor_window: 10_000,
             blocks_per_assignment: 32,
             receipts_per_request: 16,
             request_timeout_ms: 4000,
             log_flush_ms: 1000,
             log_flush_lines: 200,
+            verbosity: Verbosity::Minimal,
             quiet: false,
             peer_failure_threshold: 5,
             peer_ban_secs: 120,
@@ -319,6 +378,12 @@ impl CliConfig {
         let mut config = Self::default();
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
+            if let Some(level) = Verbosity::from_flag(&arg) {
+                if level > config.verbosity {
+                    config.verbosity = level;
+                }
+                continue;
+            }
             match arg.as_str() {
                 "--run-secs" => config.run_secs = parse_u64_arg(&mut args),
                 "--max-outbound" => config.max_outbound = parse_usize_arg(&mut args, config.max_outbound),
@@ -329,6 +394,9 @@ impl CliConfig {
                     config.refill_interval_ms = parse_u64_arg(&mut args).unwrap_or(config.refill_interval_ms)
                 }
                 "--max-inbound" => config.max_inbound = parse_optional_usize_arg(&mut args),
+                "--anchor-window" => {
+                    config.anchor_window = parse_u64_arg(&mut args).unwrap_or(config.anchor_window)
+                }
                 "--blocks-per-assignment" => {
                     config.blocks_per_assignment = parse_usize_arg(&mut args, config.blocks_per_assignment)
                 }
@@ -366,6 +434,8 @@ impl CliConfig {
                         config.refill_interval_ms = value.parse().unwrap_or(config.refill_interval_ms);
                     } else if let Some(value) = arg.strip_prefix("--max-inbound=") {
                         config.max_inbound = value.parse().ok();
+                    } else if let Some(value) = arg.strip_prefix("--anchor-window=") {
+                        config.anchor_window = value.parse().unwrap_or(config.anchor_window);
                     } else if let Some(value) = arg.strip_prefix("--blocks-per-assignment=") {
                         config.blocks_per_assignment = value.parse().unwrap_or(config.blocks_per_assignment);
                     } else if let Some(value) = arg.strip_prefix("--receipts-per-request=") {
@@ -508,13 +578,12 @@ async fn request_head_number(
     }
 }
 
-fn build_anchor_targets() -> Vec<u64> {
-    const ANCHOR_WINDOW: u64 = 10_000;
+fn build_anchor_targets(anchor_window: u64) -> Vec<u64> {
     const ANCHORS: [u64; 5] = [10_000_835, 11_362_579, 12_369_621, 16_291_127, 21_688_329];
 
     let mut targets = Vec::new();
     for anchor in ANCHORS {
-        for offset in 0..ANCHOR_WINDOW {
+        for offset in 0..anchor_window {
             targets.push(anchor + offset);
         }
     }
@@ -569,12 +638,21 @@ async fn probe_block_batch(
                 let retry = attempt <= context.config.max_attempts;
                 if retry {
                     context.requeue_blocks(&[*block]).await;
+                    context.record_retry().await;
+                } else {
+                    context.record_failed_block().await;
                 }
+                let failure_reason = if err == "timeout" {
+                    "header_timeout"
+                } else {
+                    "header_batch"
+                };
+                context.record_failure_reason(failure_reason).await;
                 context
                     .stats
                     .lock()
                     .await
-                    .record_probe(*block, false, false, header_ms, None);
+                    .record_probe(&peer_key, *block, false, false, header_ms, None);
                 context
                     .update_window(&peer_key, header_ms, None, false)
                     .await;
@@ -590,7 +668,7 @@ async fn probe_block_batch(
                     "will_retry": retry,
                     "error": err,
                 });
-                if !context.config.quiet {
+                if !context.config.quiet && context.config.verbosity >= Verbosity::V3 {
                     println!("{}", payload);
                 }
                 context.log_probe(payload).await;
@@ -635,12 +713,16 @@ async fn probe_block_batch(
             let retry = attempt <= context.config.max_attempts;
             if retry {
                 context.requeue_blocks(&[*block]).await;
+                context.record_retry().await;
+            } else {
+                context.record_failed_block().await;
             }
+            context.record_failure_reason("missing_header").await;
             context
                 .stats
                 .lock()
                 .await
-                .record_probe(*block, false, false, header_ms, None);
+                .record_probe(&peer_key, *block, false, false, header_ms, None);
             context
                 .update_window(&peer_key, header_ms, None, false)
                 .await;
@@ -659,7 +741,7 @@ async fn probe_block_batch(
                 "will_retry": retry,
                 "error": "missing_header",
             });
-            if !context.config.quiet {
+            if !context.config.quiet && context.config.verbosity >= Verbosity::V3 {
                 println!("{}", payload);
             }
             context.log_probe(payload).await;
@@ -712,11 +794,11 @@ async fn probe_block_batch(
                 context.record_peer_success(&peer_key).await;
                 for (idx, block) in chunk_blocks.iter().enumerate() {
                     if let Some(receipt_count) = counts.get(idx).copied() {
-                        context
-                            .stats
-                            .lock()
-                            .await
-                            .record_probe(*block, true, true, header_ms, Some(receipts_ms));
+                    context
+                        .stats
+                        .lock()
+                        .await
+                        .record_probe(&peer_key, *block, true, true, header_ms, Some(receipts_ms));
                         context
                             .update_window(&peer_key, header_ms, Some(receipts_ms), true)
                             .await;
@@ -732,7 +814,7 @@ async fn probe_block_batch(
                             "receipts_ms": receipts_ms,
                             "receipts": receipt_count,
                         });
-                        if !context.config.quiet {
+                        if !context.config.quiet && context.config.verbosity >= Verbosity::V3 {
                             println!("{}", payload);
                         }
                         context.log_probe(payload).await;
@@ -741,12 +823,16 @@ async fn probe_block_batch(
                         let retry = attempt <= context.config.max_attempts;
                         if retry {
                             context.requeue_blocks(&[*block]).await;
+                            context.record_retry().await;
+                        } else {
+                            context.record_failed_block().await;
                         }
+                        context.record_failure_reason("receipt_count_missing").await;
                         context
                             .stats
                             .lock()
                             .await
-                            .record_probe(*block, true, false, header_ms, Some(receipts_ms));
+                            .record_probe(&peer_key, *block, true, false, header_ms, Some(receipts_ms));
                         context
                             .update_window(&peer_key, header_ms, Some(receipts_ms), false)
                             .await;
@@ -763,7 +849,7 @@ async fn probe_block_batch(
                             "will_retry": retry,
                             "error": "receipt_count_missing",
                         });
-                        if !context.config.quiet {
+                        if !context.config.quiet && context.config.verbosity >= Verbosity::V3 {
                             println!("{}", payload);
                         }
                         context.log_probe(payload).await;
@@ -787,12 +873,21 @@ async fn probe_block_batch(
                     let retry = attempt <= context.config.max_attempts;
                     if retry {
                         context.requeue_blocks(&[*block]).await;
+                        context.record_retry().await;
+                    } else {
+                        context.record_failed_block().await;
                     }
+                    let failure_reason = if err == "timeout" {
+                        "receipts_timeout"
+                    } else {
+                        "receipts_batch"
+                    };
+                    context.record_failure_reason(failure_reason).await;
                     context
                         .stats
                         .lock()
                         .await
-                        .record_probe(*block, true, false, header_ms, Some(receipts_ms));
+                        .record_probe(&peer_key, *block, true, false, header_ms, Some(receipts_ms));
                     context
                         .update_window(&peer_key, header_ms, Some(receipts_ms), false)
                         .await;
@@ -809,7 +904,7 @@ async fn probe_block_batch(
                         "will_retry": retry,
                         "error": err,
                     });
-                    if !context.config.quiet {
+                    if !context.config.quiet && context.config.verbosity >= Verbosity::V3 {
                         println!("{}", payload);
                     }
                     context.log_probe(payload).await;
@@ -1001,11 +1096,19 @@ struct RunContext {
     attempts: Mutex<HashMap<u64, u32>>,
     peer_health: Mutex<HashMap<String, PeerHealth>>,
     active_peers: Mutex<HashSet<String>>,
+    peers_with_jobs: Mutex<HashSet<String>>,
     window: Mutex<WindowStats>,
     config: CliConfig,
     peers_handle: PeersHandle,
     logger: Logger,
     request_id: AtomicU64,
+    total_targets: usize,
+    discovered: AtomicU64,
+    sessions: AtomicU64,
+    jobs_assigned: AtomicU64,
+    in_flight: AtomicU64,
+    run_start: Instant,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
 }
 
 impl RunContext {
@@ -1043,6 +1146,9 @@ impl RunContext {
     }
 
     async fn log_request(&self, value: serde_json::Value) {
+        if !self.config.quiet && self.config.verbosity >= Verbosity::V3 {
+            println!("{value}");
+        }
         self.logger.log_request(value).await;
     }
 
@@ -1061,7 +1167,27 @@ impl RunContext {
 
     async fn record_active_peer(&self, peer_key: String) {
         let mut active = self.active_peers.lock().await;
-        active.insert(peer_key);
+        if active.insert(peer_key) {
+            self.sessions.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    async fn record_peer_job(&self, peer_key: &str) {
+        self.jobs_assigned.fetch_add(1, Ordering::SeqCst);
+        let mut peers = self.peers_with_jobs.lock().await;
+        peers.insert(peer_key.to_string());
+    }
+
+    fn inc_in_flight(&self) {
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn dec_in_flight(&self) {
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    async fn completed_blocks(&self) -> usize {
+        self.known_blocks.lock().await.len()
     }
 
     async fn update_window(
@@ -1113,6 +1239,33 @@ impl RunContext {
             entry.consecutive_failures = 0;
             entry.ban_until = None;
         }
+    }
+
+    async fn record_failure_reason(&self, reason: &str) {
+        self.stats
+            .lock()
+            .await
+            .record_failure_reason(reason);
+    }
+
+    async fn record_retry(&self) {
+        self.stats.lock().await.record_retry();
+    }
+
+    async fn record_failed_block(&self) {
+        self.stats.lock().await.record_failed_block();
+    }
+
+    async fn failed_blocks_total(&self) -> u64 {
+        self.stats.lock().await.failed_blocks_total
+    }
+
+    async fn record_window(&self, blocks_per_sec: f64) {
+        self.stats.lock().await.record_window(blocks_per_sec);
+    }
+
+    async fn record_drain(&self, secs: f64) {
+        self.stats.lock().await.record_drain(secs);
     }
 
     async fn handle_peer_failure(&self, peer_id: PeerId, peer_key: &str, reason: &str) -> bool {
@@ -1308,11 +1461,31 @@ struct BlockStats {
 }
 
 #[derive(Default)]
+struct PeerStats {
+    blocks_total: u64,
+    blocks_ok: u64,
+    header_ok: u64,
+    receipts_ok: u64,
+    header_ms_sum: u128,
+    receipts_ms_sum: u128,
+}
+
+#[derive(Default)]
 struct Stats {
     by_block: HashMap<u64, BlockStats>,
     clients: HashMap<String, u64>,
+    peer_stats: HashMap<String, PeerStats>,
+    failure_reasons: HashMap<String, u64>,
     total_probes: u64,
     receipts_ok_total: u64,
+    retries_total: u64,
+    failed_blocks_total: u64,
+    header_ms_all: Vec<u128>,
+    receipts_ms_all: Vec<u128>,
+    window_blocks_per_sec_sum: f64,
+    window_blocks_per_sec_max: f64,
+    window_count: u64,
+    drain_time_secs: Option<f64>,
 }
 
 impl Stats {
@@ -1322,6 +1495,7 @@ impl Stats {
 
     fn record_probe(
         &mut self,
+        peer_key: &str,
         block: u64,
         header_ok: bool,
         receipts_ok: bool,
@@ -1331,24 +1505,74 @@ impl Stats {
         let stats = self.by_block.entry(block).or_default();
         stats.total += 1;
         self.total_probes += 1;
+        let peer = self.peer_stats.entry(peer_key.to_string()).or_default();
+        peer.blocks_total += 1;
         if header_ok {
             stats.header_ok += 1;
             stats.header_ms_sum += header_ms;
+            peer.header_ok += 1;
+            peer.header_ms_sum += header_ms;
+            self.header_ms_all.push(header_ms);
         }
         if receipts_ok {
             stats.receipts_ok += 1;
             self.receipts_ok_total += 1;
+            peer.blocks_ok += 1;
+            peer.receipts_ok += 1;
             if let Some(ms) = receipts_ms {
                 stats.receipts_ms_sum += ms;
+                peer.receipts_ms_sum += ms;
+                self.receipts_ms_all.push(ms);
             }
+        }
+    }
+
+    fn record_retry(&mut self) {
+        self.retries_total += 1;
+    }
+
+    fn record_failed_block(&mut self) {
+        self.failed_blocks_total += 1;
+    }
+
+    fn record_failure_reason(&mut self, reason: &str) {
+        *self.failure_reasons.entry(reason.to_string()).or_insert(0) += 1;
+    }
+
+    fn record_window(&mut self, blocks_per_sec: f64) {
+        self.window_blocks_per_sec_sum += blocks_per_sec;
+        if blocks_per_sec > self.window_blocks_per_sec_max {
+            self.window_blocks_per_sec_max = blocks_per_sec;
+        }
+        self.window_count += 1;
+    }
+
+    fn record_drain(&mut self, secs: f64) {
+        if self.drain_time_secs.is_none() {
+            self.drain_time_secs = Some(secs);
         }
     }
 }
 
-async fn summarize_stats(stats: &Mutex<Stats>, elapsed: Duration) -> serde_json::Value {
+async fn summarize_stats(
+    stats: &Mutex<Stats>,
+    elapsed: Duration,
+    total_targets: usize,
+    completed_blocks: usize,
+) -> serde_json::Value {
     let stats = stats.lock().await;
     let elapsed_secs = elapsed.as_secs_f64().max(0.001);
     let throughput_blocks = stats.receipts_ok_total as f64 / elapsed_secs;
+    let coverage = if total_targets > 0 {
+        completed_blocks as f64 / total_targets as f64
+    } else {
+        0.0
+    };
+    let avg_window_blocks_per_sec = if stats.window_count > 0 {
+        stats.window_blocks_per_sec_sum / stats.window_count as f64
+    } else {
+        0.0
+    };
     let mut blocks: Vec<_> = stats.by_block.iter().map(|(block, stats)| {
         let header_rate = if stats.total > 0 {
             stats.header_ok as f64 / stats.total as f64
@@ -1384,6 +1608,46 @@ async fn summarize_stats(stats: &Mutex<Stats>, elapsed: Duration) -> serde_json:
 
     blocks.sort_by_key(|entry| entry["block"].as_u64().unwrap_or_default());
 
+    let header_p50 = percentile_from(&stats.header_ms_all, 0.50);
+    let header_p95 = percentile_from(&stats.header_ms_all, 0.95);
+    let header_p99 = percentile_from(&stats.header_ms_all, 0.99);
+    let receipts_p50 = percentile_from(&stats.receipts_ms_all, 0.50);
+    let receipts_p95 = percentile_from(&stats.receipts_ms_all, 0.95);
+    let receipts_p99 = percentile_from(&stats.receipts_ms_all, 0.99);
+
+    let mut peer_rows: Vec<_> = stats
+        .peer_stats
+        .iter()
+        .map(|(peer, stats)| {
+            let avg_header_ms = if stats.header_ok > 0 {
+                stats.header_ms_sum as f64 / stats.header_ok as f64
+            } else {
+                0.0
+            };
+            let avg_receipts_ms = if stats.receipts_ok > 0 {
+                stats.receipts_ms_sum as f64 / stats.receipts_ok as f64
+            } else {
+                0.0
+            };
+            json!({
+                "peer_id": peer,
+                "blocks_total": stats.blocks_total,
+                "blocks_ok": stats.blocks_ok,
+                "avg_header_ms": avg_header_ms,
+                "avg_receipts_ms": avg_receipts_ms,
+            })
+        })
+        .collect();
+    peer_rows.sort_by(|a, b| {
+        b["blocks_ok"]
+            .as_u64()
+            .unwrap_or(0)
+            .cmp(&a["blocks_ok"].as_u64().unwrap_or(0))
+    });
+    if peer_rows.len() > 10 {
+        peer_rows.truncate(10);
+    }
+
     json!({
         "event": "summary",
         "duration_secs": elapsed_secs,
@@ -1391,6 +1655,22 @@ async fn summarize_stats(stats: &Mutex<Stats>, elapsed: Duration) -> serde_json:
         "receipts_ok_total": stats.receipts_ok_total,
         "blocks_ok_total": stats.receipts_ok_total,
         "throughput_blocks_per_sec": throughput_blocks,
+        "avg_window_blocks_per_sec": avg_window_blocks_per_sec,
+        "max_window_blocks_per_sec": stats.window_blocks_per_sec_max,
+        "total_targets": total_targets,
+        "completed_blocks": completed_blocks,
+        "coverage": coverage,
+        "failed_blocks_total": stats.failed_blocks_total,
+        "retries_total": stats.retries_total,
+        "failure_reasons": stats.failure_reasons,
+        "header_p50_ms": header_p50,
+        "header_p95_ms": header_p95,
+        "header_p99_ms": header_p99,
+        "receipts_p50_ms": receipts_p50,
+        "receipts_p95_ms": receipts_p95,
+        "receipts_p99_ms": receipts_p99,
+        "peer_leaderboard": peer_rows,
+        "drain_time_secs": stats.drain_time_secs,
         "peers": stats.clients,
         "by_block": blocks,
     })
@@ -1403,10 +1683,18 @@ fn spawn_window_stats(context: Arc<RunContext>) {
     let interval = Duration::from_secs(context.config.stats_interval_secs);
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
+        let mut drain_streak = 0u8;
         loop {
             ticker.tick().await;
             let queue_len = context.queue_len().await;
             let active_peers = context.active_peers.lock().await.len();
+            let peers_with_jobs = context.peers_with_jobs.lock().await.len();
+            let completed = context.completed_blocks().await;
+            let failed = context.failed_blocks_total().await as usize;
+            let discovered = context.discovered.load(Ordering::SeqCst);
+            let sessions = context.sessions.load(Ordering::SeqCst);
+            let jobs_assigned = context.jobs_assigned.load(Ordering::SeqCst);
+            let in_flight = context.in_flight.load(Ordering::SeqCst);
             let mut window = context.window.lock().await;
             let snapshot = window.take_snapshot();
             drop(window);
@@ -1419,6 +1707,7 @@ fn spawn_window_stats(context: Arc<RunContext>) {
             let window_secs = interval.as_secs_f64().max(0.001);
             let probes_per_sec = snapshot.blocks_total as f64 / window_secs;
             let blocks_per_sec = snapshot.blocks_ok as f64 / window_secs;
+            context.record_window(blocks_per_sec).await;
             let payload = json!({
                 "event": "window_stats",
                 "interval_secs": interval.as_secs(),
@@ -1434,11 +1723,124 @@ fn spawn_window_stats(context: Arc<RunContext>) {
                 "at_ms": now_ms(),
             });
             if !context.config.quiet {
-                println!("{}", payload);
+                let progress = format_progress_line(
+                    completed,
+                    failed,
+                    context.total_targets,
+                    queue_len,
+                    in_flight,
+                    discovered,
+                    sessions,
+                    active_peers,
+                    peers_with_jobs,
+                    jobs_assigned,
+                );
+                if context.config.verbosity == Verbosity::Minimal {
+                    print!("\r{progress}");
+                    let _ = std::io::stdout().flush();
+                } else {
+                    println!("{progress}");
+                }
+                if context.config.verbosity >= Verbosity::V1 {
+                    println!(
+                        "window blocks/s={:.2} probes/s={:.2} hdr_p50/p95={}ms/{}ms rcp_p50/p95={}ms/{}ms active_peers_window={}",
+                        blocks_per_sec,
+                        probes_per_sec,
+                        header_p50,
+                        header_p95,
+                        receipts_p50,
+                        receipts_p95,
+                        snapshot.peers.len(),
+                    );
+                }
+                if context.config.verbosity >= Verbosity::V2 {
+                    if let Some(summary) = top_peer_summary(&context, 5).await {
+                        println!("{summary}");
+                    }
+                }
             }
             context.logger.log_stats(payload).await;
+
+            if queue_len == 0
+                && in_flight == 0
+                && completed + failed >= context.total_targets
+            {
+                drain_streak = drain_streak.saturating_add(1);
+                context
+                    .record_drain(context.run_start.elapsed().as_secs_f64())
+                    .await;
+                if drain_streak >= 2 {
+                    let _ = context.shutdown_tx.send(true);
+                }
+            } else {
+                drain_streak = 0;
+            }
         }
     });
+}
+
+fn format_progress_line(
+    completed: usize,
+    failed: usize,
+    total: usize,
+    queue_len: usize,
+    in_flight: u64,
+    discovered: u64,
+    sessions: u64,
+    active_peers: usize,
+    peers_with_jobs: usize,
+    jobs_assigned: u64,
+) -> String {
+    let pct = if total > 0 {
+        (completed as f64 / total as f64) * 100.0
+    } else {
+        0.0
+    };
+    format!(
+        "progress {}/{} ({:.1}%) | failed={} | queue={} in_flight={} | peers: discovered={} sessions={} active={} assigned={} jobs={} ",
+        completed,
+        total,
+        pct,
+        failed,
+        queue_len,
+        in_flight,
+        discovered,
+        sessions,
+        active_peers,
+        peers_with_jobs,
+        jobs_assigned
+    )
+}
+
+async fn top_peer_summary(context: &RunContext, limit: usize) -> Option<String> {
+    let stats = context.stats.lock().await;
+    if stats.peer_stats.is_empty() {
+        return None;
+    }
+    let mut peers: Vec<_> = stats.peer_stats.iter().collect();
+    peers.sort_by(|a, b| b.1.blocks_ok.cmp(&a.1.blocks_ok));
+    let mut parts = Vec::new();
+    for (peer, stat) in peers.into_iter().take(limit) {
+        let avg_header_ms = if stat.header_ok > 0 {
+            stat.header_ms_sum as f64 / stat.header_ok as f64
+        } else {
+            0.0
+        };
+        let avg_receipts_ms = if stat.receipts_ok > 0 {
+            stat.receipts_ms_sum as f64 / stat.receipts_ok as f64
+        } else {
+            0.0
+        };
+        parts.push(format!(
+            "{} ok={}/{} hdr={:.1}ms rcp={:.1}ms",
+            peer,
+            stat.blocks_ok,
+            stat.blocks_total,
+            avg_header_ms,
+            avg_receipts_ms
+        ));
+    }
+    Some(format!("top_peers | {}", parts.join(" | ")))
 }
 
 fn percentile(values: &mut Vec<u128>, percentile: f64) -> u128 {
@@ -1448,6 +1850,14 @@ fn percentile(values: &mut Vec<u128>, percentile: f64) -> u128 {
     values.sort_unstable();
     let idx = ((values.len() - 1) as f64 * percentile).round() as usize;
     values[idx]
+}
+
+fn percentile_from(values: &[u128], pct: f64) -> u128 {
+    if values.is_empty() {
+        return 0;
+    }
+    let mut copy = values.to_vec();
+    percentile(&mut copy, pct)
 }
 
 async fn request_receipts_legacy(

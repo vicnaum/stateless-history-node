@@ -100,7 +100,6 @@ def summarize_probes(probes_path: Path):
             "probes": 0,
             "header_ok": 0,
             "receipts_ok": 0,
-            "receipts_sum": 0,
             "header_ms_sum": 0,
             "receipts_ms_sum": 0,
         }
@@ -123,7 +122,6 @@ def summarize_probes(probes_path: Path):
         if entry.get("receipts_ok"):
             stats["receipts_ok"] += 1
             total_receipts_ok += 1
-            stats["receipts_sum"] += int(entry.get("receipts") or 0)
             stats["receipts_ms_sum"] += int(entry.get("receipts_ms") or 0)
 
     return total_probes, total_receipts_ok, per_peer
@@ -168,21 +166,19 @@ def main() -> None:
 
     print("\n=== Probe totals ===")
     print(f"total_probes: {total_probes}")
-    print(f"receipts_ok_total: {total_receipts_ok}")
+    print(f"blocks_ok_total: {total_receipts_ok}")
     print(f"unique_peers: {len(per_peer)}")
 
     rows = []
     for peer, stats in per_peer.items():
         receipts_ok = stats["receipts_ok"]
         probes = stats["probes"]
-        receipts_sum = stats["receipts_sum"]
         header_ok = stats["header_ok"]
         avg_header_ms = stats["header_ms_sum"] / header_ok if header_ok else 0
         avg_receipts_ms = stats["receipts_ms_sum"] / receipts_ok if receipts_ok else 0
         rows.append(
             (
                 receipts_ok,
-                receipts_sum,
                 peer,
                 probes,
                 header_ok,
@@ -194,13 +190,13 @@ def main() -> None:
 
     print("\n=== Top peers ===")
     print(
-        "peer_id\tprobes\theader_ok\treceipts_ok\treceipts_sum\tavg_header_ms\tavg_receipts_ms"
+        "peer_id\tprobes\theader_ok\tblocks_ok\tavg_header_ms\tavg_receipts_ms"
     )
-    for receipts_ok, receipts_sum, peer, probes, header_ok, avg_header_ms, avg_receipts_ms in rows[
+    for receipts_ok, peer, probes, header_ok, avg_header_ms, avg_receipts_ms in rows[
         : args.top
     ]:
         print(
-            f"{peer}\t{probes}\t{header_ok}\t{receipts_ok}\t{receipts_sum}"
+            f"{peer}\t{probes}\t{header_ok}\t{receipts_ok}"
             f"\t{avg_header_ms:.1f}\t{avg_receipts_ms:.1f}"
         )
 
