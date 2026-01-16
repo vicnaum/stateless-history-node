@@ -18,11 +18,11 @@ use reth_network::PeersConfig;
 use reth_primitives_traits::{Header, SealedHeader};
 use serde_json::json;
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, oneshot, Mutex};
@@ -88,6 +88,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         stats: Mutex::new(Stats::default()),
         queue: Mutex::new(pending_targets),
         known_blocks: Mutex::new(known_blocks),
+        failed_blocks: Mutex::new(HashSet::new()),
+        escalation_queue: Mutex::new(VecDeque::new()),
+        escalation_queued: Mutex::new(HashSet::new()),
+        escalation_attempts: Mutex::new(HashMap::new()),
+        escalation_active: AtomicBool::new(false),
         queued_blocks: Mutex::new(queued_blocks),
         attempts: Mutex::new(HashMap::new()),
         peer_health: Mutex::new(HashMap::new()),
@@ -136,9 +141,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             let batch = scheduler_context
-                .pop_next_batch_for_head(peer.head_number)
+                .next_batch_for_peer(&peer.peer_key, peer.head_number)
                 .await;
-            if batch.is_empty() {
+            if batch.blocks.is_empty() {
                 continue;
             }
             scheduler_context.record_peer_job(&peer.peer_key).await;
@@ -153,7 +158,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     peer_for_probe.peer_key,
                     peer_for_probe.messages,
                     peer_for_probe.eth_version,
-                    batch,
+                    batch.blocks,
+                    batch.mode,
                     Arc::clone(&context),
                 )
                 .await;
@@ -357,6 +363,17 @@ enum Verbosity {
     V1,
     V2,
     V3,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum ProbeMode {
+    Normal,
+    Escalation,
+}
+
+struct WorkBatch {
+    blocks: Vec<u64>,
+    mode: ProbeMode,
 }
 
 impl Verbosity {
@@ -641,11 +658,13 @@ async fn probe_block_batch(
     messages: PeerRequestSender<PeerRequest<EthNetworkPrimitives>>,
     eth_version: EthVersion,
     blocks: Vec<u64>,
+    mode: ProbeMode,
     context: Arc<RunContext>,
 ) -> bool {
     if blocks.is_empty() {
         return true;
     }
+    let is_escalation = mode == ProbeMode::Escalation;
     let header_start = Instant::now();
     let header_result = request_headers_batch(
         peer_id,
@@ -676,20 +695,32 @@ async fn probe_block_batch(
                 "probe header batch failed"
             );
             for block in &blocks {
-                let attempt = context.record_attempt(*block).await;
-                let retry = attempt <= context.config.max_attempts;
-                if retry {
-                    context.requeue_blocks(&[*block]).await;
-                    context.record_retry().await;
+                let (attempt, retry) = if is_escalation {
+                    let failure_reason = if err == "timeout" {
+                        "escalation_header_timeout"
+                    } else {
+                        "escalation_header_batch"
+                    };
+                    context.record_failure_reason(failure_reason).await;
+                    context.requeue_escalation_block(*block).await;
+                    (None, false)
                 } else {
-                    context.record_failed_block().await;
-                }
-                let failure_reason = if err == "timeout" {
-                    "header_timeout"
-                } else {
-                    "header_batch"
+                    let attempt = context.record_attempt(*block).await;
+                    let retry = attempt <= context.config.max_attempts;
+                    if retry {
+                        context.requeue_blocks(&[*block]).await;
+                        context.record_retry().await;
+                    } else {
+                        context.mark_failed_block(*block).await;
+                    }
+                    let failure_reason = if err == "timeout" {
+                        "header_timeout"
+                    } else {
+                        "header_batch"
+                    };
+                    context.record_failure_reason(failure_reason).await;
+                    (Some(attempt), retry)
                 };
-                context.record_failure_reason(failure_reason).await;
                 context
                     .stats
                     .lock()
@@ -708,6 +739,7 @@ async fn probe_block_batch(
                     "header_ms": header_ms,
                     "attempt": attempt,
                     "will_retry": retry,
+                    "mode": if is_escalation { "escalation" } else { "normal" },
                     "error": err,
                 });
                 if !context.config.quiet && context.config.verbosity >= Verbosity::V3 {
@@ -751,15 +783,22 @@ async fn probe_block_batch(
             "probe header missing in batch"
         );
         for block in &missing {
-            let attempt = context.record_attempt(*block).await;
-            let retry = attempt <= context.config.max_attempts;
-            if retry {
-                context.requeue_blocks(&[*block]).await;
-                context.record_retry().await;
+            let (attempt, retry) = if is_escalation {
+                context.record_failure_reason("escalation_missing_header").await;
+                context.requeue_escalation_block(*block).await;
+                (None, false)
             } else {
-                context.record_failed_block().await;
-            }
-            context.record_failure_reason("missing_header").await;
+                let attempt = context.record_attempt(*block).await;
+                let retry = attempt <= context.config.max_attempts;
+                if retry {
+                    context.requeue_blocks(&[*block]).await;
+                    context.record_retry().await;
+                } else {
+                    context.mark_failed_block(*block).await;
+                }
+                context.record_failure_reason("missing_header").await;
+                (Some(attempt), retry)
+            };
             context
                 .stats
                 .lock()
@@ -781,6 +820,7 @@ async fn probe_block_batch(
                 "header_ms": header_ms,
                 "attempt": attempt,
                 "will_retry": retry,
+                "mode": if is_escalation { "escalation" } else { "normal" },
                 "error": "missing_header",
             });
             if !context.config.quiet && context.config.verbosity >= Verbosity::V3 {
@@ -855,21 +895,31 @@ async fn probe_block_batch(
                             "header_ms": header_ms,
                             "receipts_ms": receipts_ms,
                             "receipts": receipt_count,
+                            "mode": if is_escalation { "escalation" } else { "normal" },
                         });
                         if !context.config.quiet && context.config.verbosity >= Verbosity::V3 {
                             println!("{}", payload);
                         }
                         context.log_probe(payload).await;
                     } else {
-                        let attempt = context.record_attempt(*block).await;
-                        let retry = attempt <= context.config.max_attempts;
-                        if retry {
-                            context.requeue_blocks(&[*block]).await;
-                            context.record_retry().await;
+                        let (attempt, retry) = if is_escalation {
+                            context
+                                .record_failure_reason("escalation_receipt_count_missing")
+                                .await;
+                            context.requeue_escalation_block(*block).await;
+                            (None, false)
                         } else {
-                            context.record_failed_block().await;
-                        }
-                        context.record_failure_reason("receipt_count_missing").await;
+                            let attempt = context.record_attempt(*block).await;
+                            let retry = attempt <= context.config.max_attempts;
+                            if retry {
+                                context.requeue_blocks(&[*block]).await;
+                                context.record_retry().await;
+                            } else {
+                                context.mark_failed_block(*block).await;
+                            }
+                            context.record_failure_reason("receipt_count_missing").await;
+                            (Some(attempt), retry)
+                        };
                         context
                             .stats
                             .lock()
@@ -889,6 +939,7 @@ async fn probe_block_batch(
                             "receipts_ms": receipts_ms,
                             "attempt": attempt,
                             "will_retry": retry,
+                            "mode": if is_escalation { "escalation" } else { "normal" },
                             "error": "receipt_count_missing",
                         });
                         if !context.config.quiet && context.config.verbosity >= Verbosity::V3 {
@@ -911,20 +962,32 @@ async fn probe_block_batch(
                     "receipts batch failed"
                 );
                 for block in &chunk_blocks {
-                    let attempt = context.record_attempt(*block).await;
-                    let retry = attempt <= context.config.max_attempts;
-                    if retry {
-                        context.requeue_blocks(&[*block]).await;
-                        context.record_retry().await;
+                    let (attempt, retry) = if is_escalation {
+                        let failure_reason = if err == "timeout" {
+                            "escalation_receipts_timeout"
+                        } else {
+                            "escalation_receipts_batch"
+                        };
+                        context.record_failure_reason(failure_reason).await;
+                        context.requeue_escalation_block(*block).await;
+                        (None, false)
                     } else {
-                        context.record_failed_block().await;
-                    }
-                    let failure_reason = if err == "timeout" {
-                        "receipts_timeout"
-                    } else {
-                        "receipts_batch"
+                        let attempt = context.record_attempt(*block).await;
+                        let retry = attempt <= context.config.max_attempts;
+                        if retry {
+                            context.requeue_blocks(&[*block]).await;
+                            context.record_retry().await;
+                        } else {
+                            context.mark_failed_block(*block).await;
+                        }
+                        let failure_reason = if err == "timeout" {
+                            "receipts_timeout"
+                        } else {
+                            "receipts_batch"
+                        };
+                        context.record_failure_reason(failure_reason).await;
+                        (Some(attempt), retry)
                     };
-                    context.record_failure_reason(failure_reason).await;
                     context
                         .stats
                         .lock()
@@ -944,6 +1007,7 @@ async fn probe_block_batch(
                         "receipts_ms": receipts_ms,
                         "attempt": attempt,
                         "will_retry": retry,
+                        "mode": if is_escalation { "escalation" } else { "normal" },
                         "error": err,
                     });
                     if !context.config.quiet && context.config.verbosity >= Verbosity::V3 {
@@ -1135,6 +1199,11 @@ struct RunContext {
     queue: Mutex<BinaryHeap<Reverse<u64>>>,
     queued_blocks: Mutex<HashSet<u64>>,
     known_blocks: Mutex<HashSet<u64>>,
+    failed_blocks: Mutex<HashSet<u64>>,
+    escalation_queue: Mutex<VecDeque<u64>>,
+    escalation_queued: Mutex<HashSet<u64>>,
+    escalation_attempts: Mutex<HashMap<u64, HashSet<String>>>,
+    escalation_active: AtomicBool,
     attempts: Mutex<HashMap<u64, u32>>,
     peer_health: Mutex<HashMap<String, PeerHealth>>,
     active_peers: Mutex<HashSet<String>>,
@@ -1183,6 +1252,101 @@ impl RunContext {
         batch
     }
 
+    async fn next_batch_for_peer(&self, peer_key: &str, head_number: u64) -> WorkBatch {
+        let batch = self.pop_next_batch_for_head(head_number).await;
+        if !batch.is_empty() {
+            return WorkBatch {
+                blocks: batch,
+                mode: ProbeMode::Normal,
+            };
+        }
+        self.maybe_start_escalation().await;
+        let escalation = self.pop_escalation_for_peer(peer_key).await;
+        WorkBatch {
+            blocks: escalation,
+            mode: ProbeMode::Escalation,
+        }
+    }
+
+    async fn maybe_start_escalation(&self) {
+        if self.escalation_active.load(Ordering::SeqCst) {
+            return;
+        }
+        if self.queue_len().await > 0 {
+            return;
+        }
+        let failed_blocks: Vec<u64> = {
+            let failed = self.failed_blocks.lock().await;
+            failed.iter().copied().collect()
+        };
+        if failed_blocks.is_empty() {
+            return;
+        }
+        let mut queue = self.escalation_queue.lock().await;
+        let mut queued = self.escalation_queued.lock().await;
+        for block in failed_blocks {
+            if queued.insert(block) {
+                queue.push_back(block);
+            }
+        }
+        self.escalation_active.store(true, Ordering::SeqCst);
+    }
+
+    async fn pop_escalation_for_peer(&self, peer_key: &str) -> Vec<u64> {
+        let mut queue = self.escalation_queue.lock().await;
+        let mut queued = self.escalation_queued.lock().await;
+        let known = self.known_blocks.lock().await;
+        let mut attempts = self.escalation_attempts.lock().await;
+        let sessions = self.sessions.load(Ordering::SeqCst) as usize;
+        let mut iterations = queue.len();
+        while iterations > 0 {
+            iterations -= 1;
+            if let Some(block) = queue.pop_front() {
+                queued.remove(&block);
+                if known.contains(&block) {
+                    continue;
+                }
+                let entry = attempts.entry(block).or_default();
+                if entry.contains(peer_key) {
+                    queue.push_back(block);
+                    queued.insert(block);
+                    continue;
+                }
+                if sessions > 0 && entry.len() >= sessions {
+                    continue;
+                }
+                entry.insert(peer_key.to_string());
+                return vec![block];
+            }
+        }
+        Vec::new()
+    }
+
+    async fn requeue_escalation_block(&self, block: u64) {
+        let sessions = self.sessions.load(Ordering::SeqCst) as usize;
+        let tried = {
+            let attempts = self.escalation_attempts.lock().await;
+            attempts.get(&block).map(|s| s.len()).unwrap_or(0)
+        };
+        if sessions > 0 && tried >= sessions {
+            self.record_failure_reason("escalation_exhausted").await;
+            return;
+        }
+        let known = self.known_blocks.lock().await;
+        if known.contains(&block) {
+            return;
+        }
+        let mut queue = self.escalation_queue.lock().await;
+        let mut queued = self.escalation_queued.lock().await;
+        if queued.insert(block) {
+            queue.push_back(block);
+        }
+    }
+
+    async fn escalation_len(&self) -> usize {
+        self.escalation_queue.lock().await.len()
+    }
+
     async fn queue_len(&self) -> usize {
         self.queue.lock().await.len()
     }
@@ -1199,10 +1363,14 @@ impl RunContext {
     }
 
     async fn mark_known_block(&self, block: u64) {
-        let mut known = self.known_blocks.lock().await;
-        if known.insert(block) {
+        let inserted = {
+            let mut known = self.known_blocks.lock().await;
+            known.insert(block)
+        };
+        if inserted {
             self.logger.log_known(block).await;
         }
+        self.clear_failed_block(block).await;
         let mut attempts = self.attempts.lock().await;
         attempts.remove(&block);
     }
@@ -1294,12 +1462,24 @@ impl RunContext {
         self.stats.lock().await.record_retry();
     }
 
-    async fn record_failed_block(&self) {
-        self.stats.lock().await.record_failed_block();
+    async fn failed_blocks_total(&self) -> u64 {
+        self.failed_blocks.lock().await.len() as u64
     }
 
-    async fn failed_blocks_total(&self) -> u64 {
-        self.stats.lock().await.failed_blocks_total
+    async fn mark_failed_block(&self, block: u64) {
+        let mut failed = self.failed_blocks.lock().await;
+        if failed.insert(block) {
+            self.stats.lock().await.record_failed_block();
+        }
+    }
+
+    async fn clear_failed_block(&self, block: u64) {
+        let mut failed = self.failed_blocks.lock().await;
+        if failed.remove(&block) {
+            self.stats.lock().await.record_failed_block_recovered();
+        }
+        let mut attempts = self.escalation_attempts.lock().await;
+        attempts.remove(&block);
     }
 
     async fn record_window(&self, blocks_per_sec: f64) {
@@ -1577,6 +1757,12 @@ impl Stats {
         self.failed_blocks_total += 1;
     }
 
+    fn record_failed_block_recovered(&mut self) {
+        if self.failed_blocks_total > 0 {
+            self.failed_blocks_total -= 1;
+        }
+    }
+
     fn record_failure_reason(&mut self, reason: &str) {
         *self.failure_reasons.entry(reason.to_string()).or_insert(0) += 1;
     }
@@ -1729,6 +1915,7 @@ fn spawn_window_stats(context: Arc<RunContext>) {
         loop {
             ticker.tick().await;
             let queue_len = context.queue_len().await;
+            let escalation_len = context.escalation_len().await;
             let in_flight = context.in_flight.load(Ordering::SeqCst);
             let mut window = context.window.lock().await;
             let snapshot = window.take_snapshot();
@@ -1760,6 +1947,7 @@ fn spawn_window_stats(context: Arc<RunContext>) {
             context.logger.log_stats(payload).await;
 
             if queue_len == 0
+                && escalation_len == 0
                 && in_flight == 0
                 && context.completed_blocks().await + context.failed_blocks_total().await as usize
                     >= context.total_targets
@@ -1810,8 +1998,12 @@ fn spawn_progress_bar(
                     let sessions = context.sessions.load(Ordering::SeqCst);
                     let queue_len = context.queue_len().await;
                     let in_flight = context.in_flight.load(Ordering::SeqCst);
+                    let escalation_active = context.escalation_active.load(Ordering::SeqCst);
+                    let escalation_len = context.escalation_len().await;
                     let status = if sessions == 0 {
                         "looking_for_peers"
+                    } else if escalation_active && escalation_len > 0 {
+                        "escalating"
                     } else if processed >= context.total_targets && queue_len == 0 && in_flight == 0 {
                         "finalizing"
                     } else {
@@ -1823,6 +2015,7 @@ fn spawn_progress_bar(
                     if !sent_shutdown
                         && processed >= context.total_targets
                         && queue_len == 0
+                        && escalation_len == 0
                         && in_flight == 0
                     {
                         let _ = context.shutdown_tx.send(true);
